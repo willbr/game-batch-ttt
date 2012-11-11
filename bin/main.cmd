@@ -144,8 +144,12 @@ exit /b
     set game_running=false
     exit /b
 
+:get_cell return_value cell_number
+    call set %1=%%game:~%2,1%%
+    exit /b
+
 :free_cell cell_number
-    call set cell=%%game:~%1,1%%
+    call :get_cell cell %1
     if "%cell%"=="-" (
         exit /b 0
     ) else (
@@ -242,28 +246,51 @@ exit /b
     exit /b
 
 :make_move_winning
-    echo move winning
+    echo move
     exit /b
 
 :make_move_block
-    echo move winning
+    echo move
     exit /b
 
 :make_move_fork
-    echo move winning
+    echo move
     exit /b
 
 :make_move_block_fork
-    echo move winning
+    echo move
     exit /b
 
 :make_move_center
-    echo move winning
+    echo move
     exit /b
 
-:make_move_opposite_corver_to_opponent
-    echo move winning
-    exit /b
+:make_move_opposite_corner_to_opponent
+    call :log game: %game%
+    for %%a in (0 2 6 8) do (
+        call :get_cell cell %%a
+        call :get_opposite_cell opposite %%a
+        if "!cell!"=="!player_char!" (
+            call :log found player cell
+            call :free_cell !opposite!
+            if errorlevel 1 (
+                call :log opposite isn't free
+            ) else (
+                call :set_cell !opposite! !computer_char!
+                exit /b 1
+            )
+        ) else (
+            call :log cell %%a : !cell! ^!= !player_char!
+        )
+    )
+    exit /b 0
+
+:get_opposite_cell return_value cell_number
+    if %2 EQU 0 ((set %1=8) && exit /b 0)
+    if %2 EQU 2 ((set %1=6) && exit /b 0)
+    if %2 EQU 6 ((set %1=2) && exit /b 0)
+    if %2 EQU 8 ((set %1=0) && exit /b 0)
+    exit /b 1
 
 :make_move_empty_corner
     call :get_empty_cell cell "0 2 6 8"
@@ -469,6 +496,43 @@ rem ==============================
     set game=---------
     call :make_move_empty_corner
     call :assert_equal "%game%" "O--------"
+    exit /b
+
+:test_make_move_opposite_corner_to_opponent
+    set game=X--------
+    call :make_move_opposite_corner_to_opponent
+    call :assert_equal "%game%" "X-------O"
+    exit /b
+
+:test_make_move_center
+    set game=---------
+    call :make_move_center
+    call :assert_equal "%game%" "----O----"
+    exit /b
+
+:test_get_cell
+    set game=X--------
+    call :get_cell cell 0
+    call :assert_equal "%cell%" "X"
+
+    set game=X--------
+    call :get_cell cell 1
+    call :assert_equal "%cell%" "-"
+
+    set game=--------O
+    call :get_cell cell 8
+    call :assert_equal "%cell%" "O"
+    exit /b
+
+:test_get_opposite_cell
+    call :get_opposite_cell cell 0
+    call :assert_equal "%cell%" "8"
+    call :get_opposite_cell cell 2
+    call :assert_equal "%cell%" "6"
+    call :get_opposite_cell cell 6
+    call :assert_equal "%cell%" "2"
+    call :get_opposite_cell cell 8
+    call :assert_equal "%cell%" "0"
     exit /b
 
 :assert_equal
