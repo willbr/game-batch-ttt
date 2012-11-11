@@ -1,0 +1,15 @@
+a 100
+mov ah,08
+int 21
+cmp al,0
+jnz 010a
+int 21
+mov ah,4c
+int 21
+
+rcx
+e
+n reply.com
+w
+q
+

@@ -1,0 +1,32 @@
+recycle
+s 100
+start
+s 100
+start
+s 100
+start
+s 100
+chimes
+s 100
+start
+s 100
+start
+s 100
+start
+s 100
+notify
+s 100
+start
+s 100
+start
+s 100
+start
+s 100
+recycle
+s 100
+start
+s 100
+start
+s 100
+start
+s 100
