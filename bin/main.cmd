@@ -265,10 +265,11 @@ exit /b
     call :free_cell 4
     if errorlevel 1 (
         call :log center cell isn't free
+        exit /b 0
     ) else (
         call :set_cell 4 %computer_char%
+        exit /b 1
     )
-    exit /b
 
 :make_move_opposite_corner_to_opponent
     call :log game: %game%
