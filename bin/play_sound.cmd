@@ -1,23 +1,8 @@
 @ echo off
 
-:: chimes
-:: chord
-:: ding
-:: recycle
-:: start
-:: tada
-:: windows xp battery critical
-:: windows xp battery low
-:: windows xp default
-:: windows xp error
-:: windows xp exclamation
-:: windows xp hardware fail
-:: windows xp hardware insert
-:: windows xp hardware remove
-
 set mediafolder=c:\windows\media
 
-if "%~1" == "/list" (
+if "%~1" == "" (
     :: print sound names
     for %%a in (%mediafolder%\*.wav) do (
         echo %%~na
