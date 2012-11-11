@@ -246,8 +246,52 @@ exit /b
     exit /b
 
 :make_move_winning
-    echo move
+    call :complete_line "0 1 2"
+    if errorlevel 1 exit /b 1
+    call :complete_line "3 4 5"
+    if errorlevel 1 exit /b 1
+    call :complete_line "6 7 8"
+    if errorlevel 1 exit /b 1
+    call :complete_line "0 3 6"
+    if errorlevel 1 exit /b 1
+    call :complete_line "1 4 7"
+    if errorlevel 1 exit /b 1
+    call :complete_line "2 7 8"
+    if errorlevel 1 exit /b 1
+    call :complete_line "0 4 8"
+    if errorlevel 1 exit /b 1
+    call :complete_line "2 4 6"
+    if errorlevel 1 exit /b 1
     exit /b
+
+:complete_line cells
+    set /a empty_cell=-1
+    set /a mark_counter=0
+    for %%a in (%~1) do (
+        call :get_cell cell %%a
+        if "!cell!"=="!computer_char!" (
+            call :log found computer mark
+            set /a mark_counter += 1
+        ) else if "!cell!"=="-" (
+            set /a empty_cell=%%a
+        ) else (
+            call :log skipping cell !cell!
+        )
+    )
+
+    call :log mark_counter %mark_counter%
+
+    if %mark_counter% EQU 2 (
+        if %empty_cell% NEQ -1 (
+            call :set_cell %empty_cell% %computer_char%
+            exit /b 1
+        ) else (
+            call :log third cell is full
+        )
+    ) else (
+        call :log didn't find two compter marks
+    )
+    exit /b 0
 
 :make_move_block
     echo move
@@ -514,6 +558,21 @@ rem ==============================
     set game=---------
     call :make_move_center
     call :assert_equal "%game%" "----O----"
+    exit /b
+
+:test_make_move_winning
+    rem row
+    set game=-OO------
+    call :make_move_winning
+    call :assert_equal "%game%" "OOO------"
+    rem col
+    set game=-O-----O-
+    call :make_move_winning
+    call :assert_equal "%game%" "-O--O--O-"
+    rem diag
+    set game=--O-O----
+    call :make_move_winning
+    call :assert_equal "%game%" "--O-O-O--"
     exit /b
 
 :test_get_cell
