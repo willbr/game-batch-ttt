@@ -1,7 +1,5 @@
 @echo off
 
-rem TODO add sound for move
-rem TODO add sound for winning
 rem TODO add perfect tictactoe ai
 rem TODO add a log of every time the unit tests are run
 
@@ -32,7 +30,10 @@ call :reset_game
 call :setup_input
 call :game_loop
 
+if "%winner%" NEQ "" call play_sound tada
+
 echo winner: %winner%
+
 pause
 
 exit /b
@@ -49,16 +50,21 @@ exit /b
     exit /b
 
 :game_loop none
-    call :check_for_game_over
-    if errorlevel 1 exit /b
 
     call :log looping
     call :log turn: %turn%
     call :log game: %game%
 
     call :think
+    call :check_for_game_over
+    if errorlevel 1 exit /b
+
     call :draw
+
     call :parse_input
+    call :check_for_game_over
+    if errorlevel 1 exit /b
+
     if "%game_running%" EQU "true" goto game_loop
     exit /b
 
@@ -341,6 +347,12 @@ rem ==============================
 :test_find_line_diag1
     set game=X---X---X
     call :find_line X
+    call :assert_equal "%errorlevel%" "1"
+    exit /b 0
+
+:test_find_line_diag2
+    set game=X-OXO-O-X
+    call :find_line O
     call :assert_equal "%errorlevel%" "1"
     exit /b 0
 
