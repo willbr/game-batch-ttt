@@ -6,7 +6,7 @@ setlocal EnableDelayedExpansion
 if errorlevel 1 (
     echo failed to enable delayed expasion
     exit /b
-    )
+)
 
 set game=qweasdzxc
 set logging=false
@@ -148,9 +148,9 @@ exit /b
     call set cell=%%game:~%1,1%%
     if "%cell%"=="-" (
         exit /b 0
-        ) else (
+    ) else (
         exit /b 1
-        )
+    )
 
 :set_cell cell_number char
     call :log set_cell %1 %2
@@ -161,21 +161,21 @@ exit /b
     call :free_cell %1
     if errorlevel 1 (
         call :log cell isn't free
-        ) else (
+    ) else (
         call :log cell is free
         set /a turn += 1
         if %1 EQU 0 (
             call set left=
             call set right=%%game:~1,8%%
-            ) else if %1 EQU 8 (
+        ) else if %1 EQU 8 (
             call set left=%%game:~0,8%%
             call set right=
-            ) else (
+        ) else (
             call set left=%%game:~0,%1%%
             call set right=%%game:~%offset%,%length%%%
-            )
-        call set game=%%left%%%2%%right%%
         )
+        call set game=%%left%%%2%%right%%
+    )
     call :log left: %left%
     call :log right: %right%
     call :log game: %game%
@@ -184,7 +184,7 @@ exit /b
 :log *message
     if "%logging%" == "true" (
         echo %* >&2
-        )
+    )
     exit /b
 
 :think
@@ -192,7 +192,7 @@ exit /b
     if %computers_turn% EQU 1 (
         echo thinking
         call :ai_make_perfect_move
-        )
+    )
     exit /b
 
 :ai_make_move
@@ -227,7 +227,7 @@ exit /b
     if errorlevel 1 (
         exit /b
     )
-    call :make_move_opposite_corver_to_opponent
+    call :make_move_opposite_corner_to_opponent
     if errorlevel 1 (
         exit /b
     )
@@ -302,12 +302,12 @@ exit /b
     if errorlevel 1 (
         set winner=computer
         set game_running=false
-        )
+    )
     call :check_if_board_is_full
     if errorlevel 1 (
         set winner=
         set game_running=false
-        )
+    )
     exit /b
 
 :check_if_board_is_full
@@ -315,10 +315,10 @@ exit /b
         call :free_cell %%a
         if errorlevel 1 (
             rem skip
-            ) else (
+        ) else (
             call :log found free cell
             exit /b 0
-            )
+        )
     )
     exit /b 1
 
