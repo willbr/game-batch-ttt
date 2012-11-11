@@ -246,31 +246,49 @@ exit /b
     exit /b
 
 :make_move_winning
-    call :complete_line "0 1 2"
+    call :make_move_complete_line O O
+    if errorlevel 1 (
+        exit /b 1
+    )
+    exit /b 0
+
+:make_move_block
+    call :make_move_complete_line X O
+    if errorlevel 1 (
+        exit /b 1
+    )
+    exit /b 0
+
+:make_move_complete_line needle mark
+    call :complete_line "0 1 2" %1 %2
     if errorlevel 1 exit /b 1
-    call :complete_line "3 4 5"
+    call :complete_line "3 4 5" %1 %2
     if errorlevel 1 exit /b 1
-    call :complete_line "6 7 8"
+    call :complete_line "6 7 8" %1 %2
     if errorlevel 1 exit /b 1
-    call :complete_line "0 3 6"
+    call :complete_line "0 3 6" %1 %2
     if errorlevel 1 exit /b 1
-    call :complete_line "1 4 7"
+    call :complete_line "1 4 7" %1 %2
     if errorlevel 1 exit /b 1
-    call :complete_line "2 7 8"
+    call :complete_line "2 7 8" %1 %2
     if errorlevel 1 exit /b 1
-    call :complete_line "0 4 8"
+    call :complete_line "0 4 8" %1 %2
     if errorlevel 1 exit /b 1
-    call :complete_line "2 4 6"
+    call :log 246 %1 %2
+    call :complete_line "2 4 6" %1 %2
     if errorlevel 1 exit /b 1
     exit /b
 
-:complete_line cells
+:complete_line cells needle mark
+    set cells=%~1
+    set needle=%2
+    set mark=%3
     set /a empty_cell=-1
     set /a mark_counter=0
-    for %%a in (%~1) do (
+    for %%a in (%cells%) do (
         call :get_cell cell %%a
-        if "!cell!"=="!computer_char!" (
-            call :log found computer mark
+        if "!cell!"=="%needle%" (
+            call :log found %needle%
             set /a mark_counter += 1
         ) else if "!cell!"=="-" (
             set /a empty_cell=%%a
@@ -283,19 +301,16 @@ exit /b
 
     if %mark_counter% EQU 2 (
         if %empty_cell% NEQ -1 (
-            call :set_cell %empty_cell% %computer_char%
+            call :set_cell %empty_cell% %mark%
             exit /b 1
         ) else (
             call :log third cell is full
         )
     ) else (
-        call :log didn't find two compter marks
+        call :log didn't find two marks matching %needle%
     )
     exit /b 0
 
-:make_move_block
-    echo move
-    exit /b
 
 :make_move_fork
     echo move
@@ -573,6 +588,13 @@ rem ==============================
     set game=--O-O----
     call :make_move_winning
     call :assert_equal "%game%" "--O-O-O--"
+    exit /b
+
+:test_make_move_block
+    set game=--X-X----
+    call :make_move_block
+    call :assert_equal "%game%" "--X-X-O--"
+    exit /b
     exit /b
 
 :test_get_cell
