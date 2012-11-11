@@ -1,7 +1,6 @@
 @echo off
 
 rem TODO add perfect tictactoe ai
-rem TODO add a log of every time the unit tests are run
 
 setlocal EnableDelayedExpansion
 if errorlevel 1 (
@@ -58,12 +57,12 @@ exit /b
     call :think
     call :check_for_game_over
     if errorlevel 1 exit /b
-
     call :draw
 
     call :parse_input
     call :check_for_game_over
     if errorlevel 1 exit /b
+    call :draw
 
     if "%game_running%" EQU "true" goto game_loop
     exit /b
@@ -192,7 +191,7 @@ exit /b
     set /a computers_turn=%turn% %% 2
     if %computers_turn% EQU 1 (
         echo thinking
-        call :ai_make_move
+        call :ai_make_perfect_move
         )
     exit /b
 
@@ -206,6 +205,92 @@ exit /b
     if %ai_think% GTR 100 exit /b
     if %start_turn% EQU %turn% goto :ai_loop
     exit /b
+
+:ai_make_perfect_move
+    call :make_move_winning
+    if errorlevel 1 (
+        exit /b
+    )
+    call :make_move_block
+    if errorlevel 1 (
+        exit /b
+    )
+    call :make_move_fork
+    if errorlevel 1 (
+        exit /b
+    )
+    call :make_move_block_fork
+    if errorlevel 1 (
+        exit /b
+    )
+    call :make_move_center
+    if errorlevel 1 (
+        exit /b
+    )
+    call :make_move_opposite_corver_to_opponent
+    if errorlevel 1 (
+        exit /b
+    )
+    call :make_move_empty_corner
+    if errorlevel 1 (
+        exit /b
+    )
+    call :make_move_empty_side
+    if errorlevel 1 (
+        exit /b
+    )
+    exit /b
+
+:make_move_winning
+    echo move winning
+    exit /b
+
+:make_move_block
+    echo move winning
+    exit /b
+
+:make_move_fork
+    echo move winning
+    exit /b
+
+:make_move_block_fork
+    echo move winning
+    exit /b
+
+:make_move_center
+    echo move winning
+    exit /b
+
+:make_move_opposite_corver_to_opponent
+    echo move winning
+    exit /b
+
+:make_move_empty_corner
+    echo move winning
+    exit /b
+
+:make_move_empty_side
+    call :get_empty_cell cell "1 3 5 7"
+    if errorlevel 1 (
+        echo no empty cell
+    ) else (
+        call :set_cell %cell% %computer_char%
+        exit /b 1
+    )
+    exit /b 0
+
+:get_empty_cell return_value cells
+    for %%a in (%~2) do (
+        call :log cell %%a
+        call :free_cell %%a
+        if errorlevel 1 (
+            call :log skipping filled cell: %%a
+        ) else (
+            set %1=%%a
+            exit /b 0
+        )
+    )
+    exit /b 1
 
 :check_for_game_over
     call :find_line %player_char%
@@ -366,6 +451,12 @@ rem ==============================
     set game=XXXXXXXXX
     call :check_if_board_is_full
     call :assert_equal "%errorlevel%" "1"
+    exit /b
+
+:test_make_move_empty_side
+    set game=---------
+    call :make_move_empty_side
+    call :assert_equal "%game%" "-O-------"
     exit /b
 
 :assert_equal
