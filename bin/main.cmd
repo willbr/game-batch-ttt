@@ -266,8 +266,14 @@ exit /b
     exit /b
 
 :make_move_empty_corner
-    echo move winning
-    exit /b
+    call :get_empty_cell cell "0 2 6 8"
+    if errorlevel 1 (
+        echo no empty cell
+    ) else (
+        call :set_cell %cell% %computer_char%
+        exit /b 1
+    )
+    exit /b 0
 
 :make_move_empty_side
     call :get_empty_cell cell "1 3 5 7"
@@ -457,6 +463,12 @@ rem ==============================
     set game=---------
     call :make_move_empty_side
     call :assert_equal "%game%" "-O-------"
+    exit /b
+
+:test_make_move_empty_corner
+    set game=---------
+    call :make_move_empty_corner
+    call :assert_equal "%game%" "O--------"
     exit /b
 
 :assert_equal
