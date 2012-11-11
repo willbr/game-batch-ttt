@@ -262,7 +262,12 @@ exit /b
     exit /b
 
 :make_move_center
-    echo move
+    call :free_cell 4
+    if errorlevel 1 (
+        call :log center cell isn't free
+    ) else (
+        call :set_cell 4 %computer_char%
+    )
     exit /b
 
 :make_move_opposite_corner_to_opponent
