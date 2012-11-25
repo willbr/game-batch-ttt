@@ -33,8 +33,6 @@ if "%winner%" NEQ "" call play_sound tada
 
 echo winner: %winner%
 
-pause
-
 exit /b
 
 :draw none
@@ -219,15 +217,15 @@ exit /b
     if errorlevel 1 (
         exit /b
     )
+    call :make_move_center
+    if errorlevel 1 (
+        exit /b
+    )
     call :make_move_fork
     if errorlevel 1 (
         exit /b
     )
     call :make_move_block_fork
-    if errorlevel 1 (
-        exit /b
-    )
-    call :make_move_center
     if errorlevel 1 (
         exit /b
     )
@@ -313,11 +311,37 @@ exit /b
 
 
 :make_move_fork
-    echo move
     exit /b
 
 :make_move_block_fork
-    echo move
+    rem check for fork 1
+    call :get_row a 0
+    call :get_column b 0
+    if "%a%%b%"=="X--X--" (
+        call :set_cell 1 %computer_char%
+        exit /b 1
+        )
+    rem check for fork 2
+    call :get_row a 0
+    call :get_column b 2
+    if "%a%%b%"=="X--X--" (
+        call :set_cell 1 %computer_char%
+        exit /b 1
+        )
+    rem check for fork 3
+    call :get_row a 2
+    call :get_column b 2
+    if "%a%%b%"=="X--X--" (
+        call :set_cell 7 %computer_char%
+        exit /b 1
+        )
+    rem check for fork 4
+    call :get_row a 2
+    call :get_column b 0
+    if "%a%%b%"=="X--X--" (
+        call :set_cell 7 %computer_char%
+        exit /b 1
+        )
     exit /b
 
 :make_move_center
@@ -447,6 +471,44 @@ exit /b
     call :log diag2: %game:~2,1%%game:~4,1%%game:~6,1%
     exit /b 0
 
+:get_row rval n
+    if %2 EQU 0 (
+        set %1=%game:~0,3%
+    ) else if %2 EQU 1 (
+        set %1=%game:~3,3%
+    ) else if %2 EQU 2 (
+        set %1=%game:~6,3%
+    ) else (
+        set %1=
+        call :log invalid row number: %2
+    )
+    exit /b
+
+:get_column rval n
+    if %2 EQU 0 (
+        set %1=%game:~0,1%%game:~3,1%%game:~6,1%
+    ) else if %2 EQU 1 (
+        set %1=%game:~1,1%%game:~4,1%%game:~7,1%
+    ) else if %2 EQU 2 (
+        set %1=%game:~2,1%%game:~5,1%%game:~8,1%
+    ) else (
+        set %1=
+        call :log invalid column number: %2
+    )
+    exit /b
+
+:get_diagonal rval n
+    if %2 EQU 0 (
+        set %1=%game:~0,1%%game:~4,1%%game:~8,1%
+    ) else if %2 EQU 1 (
+        set %1=%game:~2,1%%game:~4,1%%game:~6,1%
+    ) else (
+        set %1=
+        call :log invalid diagonal number: %2
+    )
+    exit /b
+
+
 rem ==============================
 rem TESTS
 rem ==============================
@@ -475,7 +537,6 @@ rem ==============================
     echo pass: %pass%
     echo fail: %fail%
     echo.
-    pause
     exit /b
 
 :test_move_q
@@ -620,6 +681,12 @@ rem ==============================
     call :assert_equal "%cell%" "2"
     call :get_opposite_cell cell 8
     call :assert_equal "%cell%" "0"
+    exit /b
+
+:test_block_fork
+    set game=X---O---X
+    call :ai_make_perfect_move
+    call :assert_equal "%game%" "XO--O---X"
     exit /b
 
 :assert_equal
