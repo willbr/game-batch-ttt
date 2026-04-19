@@ -217,15 +217,15 @@ exit /b
     if errorlevel 1 (
         exit /b
     )
-    call :make_move_center
-    if errorlevel 1 (
-        exit /b
-    )
     call :make_move_fork
     if errorlevel 1 (
         exit /b
     )
     call :make_move_block_fork
+    if errorlevel 1 (
+        exit /b
+    )
+    call :make_move_center
     if errorlevel 1 (
         exit /b
     )
@@ -268,7 +268,7 @@ exit /b
     if errorlevel 1 exit /b 1
     call :complete_line "1 4 7" %1 %2
     if errorlevel 1 exit /b 1
-    call :complete_line "2 7 8" %1 %2
+    call :complete_line "2 5 8" %1 %2
     if errorlevel 1 exit /b 1
     call :complete_line "0 4 8" %1 %2
     if errorlevel 1 exit /b 1
@@ -311,7 +311,71 @@ exit /b
 
 
 :make_move_fork
-    exit /b
+    rem For each empty cell C, hypothetically place O and count lines
+    rem that would have 2 O + 1 empty + 0 X (i.e. new winning threats).
+    rem If 2+, C creates a fork -- play it for real.
+    set fork_save_game=%game%
+    set fork_save_turn=%turn%
+    for /l %%c in (0,1,8) do (
+        call :free_cell %%c
+        if errorlevel 1 (
+            rem cell is filled, skip
+        ) else (
+            set game=!fork_save_game!
+            set turn=!fork_save_turn!
+            call :set_cell %%c %computer_char%
+            call :count_threats %computer_char% fork_n
+            if !fork_n! GEQ 2 (
+                set game=!fork_save_game!
+                set turn=!fork_save_turn!
+                call :set_cell %%c %computer_char%
+                exit /b 1
+            )
+        )
+    )
+    set game=%fork_save_game%
+    set turn=%fork_save_turn%
+    exit /b 0
+
+:count_threats mark result
+    rem count lines that currently have 2 <mark>, 1 empty, 0 of the other mark
+    set /a threat_n=0
+    call :line_is_threat "0 1 2" %1
+    if errorlevel 1 set /a threat_n+=1
+    call :line_is_threat "3 4 5" %1
+    if errorlevel 1 set /a threat_n+=1
+    call :line_is_threat "6 7 8" %1
+    if errorlevel 1 set /a threat_n+=1
+    call :line_is_threat "0 3 6" %1
+    if errorlevel 1 set /a threat_n+=1
+    call :line_is_threat "1 4 7" %1
+    if errorlevel 1 set /a threat_n+=1
+    call :line_is_threat "2 5 8" %1
+    if errorlevel 1 set /a threat_n+=1
+    call :line_is_threat "0 4 8" %1
+    if errorlevel 1 set /a threat_n+=1
+    call :line_is_threat "2 4 6" %1
+    if errorlevel 1 set /a threat_n+=1
+    set %2=%threat_n%
+    exit /b 0
+
+:line_is_threat cells mark
+    rem errorlevel 1 if line has exactly 2 <mark> + 1 empty + 0 of the other
+    set lit_cells=%~1
+    set lit_mark=%2
+    set lit_opp=X
+    if "%lit_mark%"=="X" set lit_opp=O
+    set /a lit_m=0
+    set /a lit_o=0
+    set /a lit_e=0
+    for %%k in (%lit_cells%) do (
+        call :get_cell g %%k
+        if "!g!"=="%lit_mark%" set /a lit_m+=1
+        if "!g!"=="%lit_opp%"  set /a lit_o+=1
+        if "!g!"=="-"           set /a lit_e+=1
+    )
+    if %lit_m% EQU 2 if %lit_o% EQU 0 if %lit_e% EQU 1 exit /b 1
+    exit /b 0
 
 :make_move_block_fork
     rem check for fork 1
@@ -687,6 +751,28 @@ rem ==============================
     set game=X---O---X
     call :ai_make_perfect_move
     call :assert_equal "%game%" "XO--O---X"
+    exit /b
+
+:test_make_move_winning_right_col
+    rem O at 2 and 5 -- win by completing the right column at 8
+    set game=--O--O---
+    call :make_move_winning
+    call :assert_equal "%game%" "--O--O--O"
+    exit /b
+
+:test_make_move_block_right_col
+    rem X at 2 and 5 -- block the right column at 8
+    set game=--X--X---
+    call :make_move_block
+    call :assert_equal "%game%" "--X--X--O"
+    exit /b
+
+:test_make_move_fork
+    rem O at 0 and 4, X at 8 -- cell 1 is a fork (row 0-1-2 + col 1-4-7
+    rem both become 2-O threats). Scan starts at 0, so cell 1 wins.
+    set game=O---O---X
+    call :make_move_fork
+    call :assert_equal "%game%" "OO--O---X"
     exit /b
 
 :assert_equal
