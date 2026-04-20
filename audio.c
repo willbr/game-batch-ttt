@@ -1,10 +1,16 @@
-/* audio.c -- miniaudio-backed WAV playback for cmd.c's sndrec32 hook. */
+/* audio.c -- miniaudio-backed WAV playback for cmd.c's sndrec32 hook.
+ *
+ * Lazy engine init on first audio_play; explicit shutdown on exit.
+ * audio_play blocks until the clip finishes so short SFX don't get
+ * cut off when the emulator exits right after the call. */
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
-#include "audio.h"
 #include <unistd.h>
+
+void audio_shutdown(void);
+int  audio_play(const char *path);
 
 static ma_engine g_engine;
 static int g_engine_ok = 0;

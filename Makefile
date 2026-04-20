@@ -10,15 +10,9 @@ AUDIO_LIBS := -lm -ldl -lpthread
 endif
 
 # Windows-media sounds mapped to macOS system sounds. afconvert ships with macOS.
-# Only the names the shipped scripts actually reference:
-#   main.cmd  -> tada
-#   song.txt  -> recycle start chimes notify
+# Only sound the shipped scripts reference is `tada` (winner in main.cmd).
 MEDIA_MAP := \
-	tada=Hero \
-	recycle=Pop \
-	start=Ping \
-	chimes=Glass \
-	notify=Tink
+	tada=Hero
 
 MEDIA_DIR := bin/media
 MEDIA_WAVS := $(foreach m,$(MEDIA_MAP),$(MEDIA_DIR)/$(firstword $(subst =, ,$(m))).wav)
@@ -26,11 +20,11 @@ MEDIA_WAVS := $(foreach m,$(MEDIA_MAP),$(MEDIA_DIR)/$(firstword $(subst =, ,$(m)
 cmd: cmd.o audio.o
 	$(CC) $(CFLAGS) -o $@ cmd.o audio.o $(AUDIO_LIBS)
 
-cmd.o: cmd.c audio.h
+cmd.o: cmd.c
 	$(CC) $(CFLAGS) -c -o $@ cmd.c
 
 # miniaudio.h is 4MB; compile with fewer flags so a warm rebuild of cmd.c stays fast.
-audio.o: audio.c audio.h miniaudio.h
+audio.o: audio.c miniaudio.h
 	$(CC) -O2 -c -o $@ audio.c
 
 $(MEDIA_DIR)/%.wav: /System/Library/Sounds

@@ -26,7 +26,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "audio.h"
+/* audio.c */
+extern void audio_shutdown(void);
+extern int  audio_play(const char *path);
 
 /* --------------------------------------------------------------- */
 /* utilities                                                       */
@@ -1060,24 +1062,6 @@ static int cmd_set(const char *rest) {
         rest += 2;
         while (*rest == ' ' || *rest == '\t') rest++;
     }
-    if (rest[0] == '/' && (rest[1] == 'p' || rest[1] == 'P') && (rest[2] == ' ' || rest[2] == '\t' || rest[2] == 0)) {
-        /* set /p var=prompt  (we skip actually prompting; write.cmd uses it with <nul) */
-        rest += 2;
-        while (*rest == ' ' || *rest == '\t') rest++;
-        const char *eq = strchr(rest, '=');
-        if (!eq) return 0;
-        char *name = sndup(rest, (size_t)(eq - rest));
-        /* trim name */
-        trim_right(name);
-        char *nm = trim_left(name);
-        /* print prompt if any, no newline */
-        const char *prompt = eq + 1;
-        char *up = unquote(prompt);
-        fputs(up, stdout); fflush(stdout);
-        /* don't read -- stdin is assumed piped to nul */
-        var_set(nm, "");
-        return 0;
-    }
     if (slash_a) {
         long v = eval_expr(rest);
         /* ECHO result only when invoked from prompt; when in a script, stay silent. */
@@ -1320,18 +1304,16 @@ static char *for_subst(const char *body, char var, const char *value) {
 static int do_for(const char *rest) {
     while (*rest == ' ' || *rest == '\t') rest++;
     int mode = 0; /* 0 = plain, 1 = /l numeric, 2 = /f file */
-    const char *fopts = NULL;
-    size_t foptslen = 0;
     if (rest[0] == '/' && (rest[1] == 'L' || rest[1] == 'l')) { mode = 1; rest += 2; }
     else if (rest[0] == '/' && (rest[1] == 'F' || rest[1] == 'f')) {
         mode = 2; rest += 2;
         while (*rest == ' ' || *rest == '\t') rest++;
+        /* skip an optional "..." options string (tokens=, usebackq, etc.) --
+         * not interpreted; our callers just use `for /f %%a in (file)`. */
         if (*rest == '"') {
             const char *q = rest + 1;
             while (*q && *q != '"') q++;
-            fopts = rest + 1;
-            foptslen = (size_t)(q - fopts);
-            if (*q == '"') rest = q + 1; else rest = q;
+            rest = (*q == '"') ? q + 1 : q;
         }
     } else if (rest[0] == '/' && (rest[1] == 'D' || rest[1] == 'd' || rest[1] == 'R' || rest[1] == 'r')) {
         rest += 2;
@@ -1388,57 +1370,24 @@ static int do_for(const char *rest) {
             if (g_frame && g_frame->returning) break;
         }
     } else if (mode == 2) {
-        /* /f %%X in (filename) do ... -- simple: one token per line (whitespace split first token) */
-        /* supports "usebackq" (quoted file path) */
+        /* /f %%X in (filename) do ... -- first whitespace token per line. */
         char *path = items_exp;
-        /* strip one level of quotes if present */
         size_t pl = strlen(path);
         if (pl >= 2 && path[0] == '"' && path[pl-1] == '"') { path[pl-1] = 0; path++; }
         char *np = path_norm(path);
         FILE *f = fopen(np, "rb");
-        /* parse tokens=1,2 etc.  default: tokens=1 */
-        int tokens_max = 1;
-        if (fopts) {
-            char o[256];
-            size_t L = foptslen < sizeof o - 1 ? foptslen : sizeof o - 1;
-            memcpy(o, fopts, L); o[L] = 0;
-            char *t = strstr(o, "tokens=");
-            if (t) {
-                t += 7;
-                /* find max token number referenced */
-                int m = 0;
-                while (*t && *t != ' ' && *t != '\t') {
-                    if (isdigit((unsigned char)*t)) {
-                        char *e;
-                        long n = strtol(t, &e, 10);
-                        if (n > m) m = (int)n;
-                        t = e;
-                    } else t++;
-                }
-                if (m > 0) tokens_max = m;
-            }
-        }
         if (f) {
             char line[4096];
             while (fgets(line, sizeof line, f)) {
                 size_t L = strlen(line);
                 while (L && (line[L-1] == '\n' || line[L-1] == '\r')) line[--L] = 0;
-                /* skip blank */
                 char *tp = line;
                 while (*tp == ' ' || *tp == '\t') tp++;
                 if (!*tp) continue;
-                /* assign tokens_max tokens to %var, %var+1, ... */
-                char *body2 = sdup(body);
-                int k = 0;
-                while (*tp && k < tokens_max) {
-                    char *te = tp;
-                    while (*te && *te != ' ' && *te != '\t') te++;
-                    char *tok = sndup(tp, (size_t)(te - tp));
-                    body2 = for_subst(body2, var + k, tok);
-                    while (*te == ' ' || *te == '\t') te++;
-                    tp = te;
-                    k++;
-                }
+                char *te = tp;
+                while (*te && *te != ' ' && *te != '\t') te++;
+                char *tok = sndup(tp, (size_t)(te - tp));
+                char *body2 = for_subst(body, var, tok);
                 rc = execute_seq(body2);
                 if (g_frame && g_frame->returning) break;
             }
@@ -1781,11 +1730,6 @@ static int run_simple(const char *s) {
     if (strieq(name, "type")) return cmd_type(rest);
     if (strieq(name, "setlocal")) return cmd_setlocal(rest);
     if (strieq(name, "endlocal")) return cmd_endlocal(rest);
-    if (strieq(name, "pause")) { (void)getchar(); return 0; }
-    if (strieq(name, "cls")) { printf("\x1b[2J\x1b[H"); return 0; }
-    if (strieq(name, "title")) return 0;
-    if (strieq(name, "color")) return 0;
-    if (strieq(name, "ver")) { printf("cmd.c fake shell\n"); return 0; }
 
     /* treat as implicit call */
     char **argv = NULL;
