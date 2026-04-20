@@ -26,6 +26,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "audio.h"
+
 /* --------------------------------------------------------------- */
 /* utilities                                                       */
 /* --------------------------------------------------------------- */
@@ -41,8 +43,6 @@ static void die(const char *fmt, ...) {
 
 static void *xmalloc(size_t n) { void *p = malloc(n); if (!p) die("oom"); return p; }
 static void *xrealloc(void *p, size_t n) { p = realloc(p, n); if (!p) die("oom"); return p; }
-static char *xstrdup(const char *s) { size_t n = strlen(s)+1; char *p = xmalloc(n); memcpy(p, s, n); return p; }
-static char *xstrndup(const char *s, size_t n) { char *p = xmalloc(n+1); memcpy(p, s, n); p[n] = 0; return p; }
 
 static int lc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
@@ -69,34 +69,23 @@ static void trim_right(char *s) {
     while (n && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r')) s[--n] = 0;
 }
 
-/* Malloc-backed growable byte buffer. Used during script load to build up
- * statement text (owned by Script, so needs malloc lifetime). */
-typedef struct { char *s; size_t len, cap; } Buf;
-static void buf_init(Buf *b) { b->cap = 64; b->len = 0; b->s = xmalloc(b->cap); b->s[0] = 0; }
-static void buf_free(Buf *b) { free(b->s); b->s = NULL; }
-static void buf_reset(Buf *b) { b->len = 0; if (b->s) b->s[0] = 0; }
-static void buf_reserve(Buf *b, size_t extra) {
-    if (b->len + extra + 1 > b->cap) {
-        while (b->len + extra + 1 > b->cap) b->cap *= 2;
-        b->s = xrealloc(b->s, b->cap);
-    }
-}
-static void buf_putc(Buf *b, char c) { buf_reserve(b, 1); b->s[b->len++] = c; b->s[b->len] = 0; }
-static void buf_puts(Buf *b, const char *s) { size_t n = strlen(s); buf_reserve(b, n); memcpy(b->s + b->len, s, n); b->len += n; b->s[b->len] = 0; }
-
 /* --------------------------------------------------------------- */
-/* scratch arena                                                   */
+/* arenas                                                          */
 /* --------------------------------------------------------------- */
 
-/* Bump allocator with mark/reset. All transient per-statement strings live
- * here (expansion results, tokens, split pieces, temporary paths). Frame
- * args live here too, below the per-statement marks.
+/* Bump allocator with mark/reset.
  *
- * execute_stmt takes a mark on entry and resets on exit. Nested calls nest
- * their marks naturally — exactly the call-stack lifetime discipline.
+ * g_scratch holds transient per-statement strings (expansion results, tokens,
+ * split pieces, temporary paths). execute_stmt takes a mark on entry and
+ * resets on exit; nested calls nest their marks naturally — exactly the
+ * call-stack lifetime discipline. Frame args live here too, below the
+ * per-statement marks.
  *
- * Vars and Script stay on malloc: their lifetimes don't match statement
- * scope, so forcing them into the arena would just leak. */
+ * Each Script also owns its own arena (script-lifetime: path, stmt strings,
+ * label names, the stmts / label arrays). script_free is then just one
+ * free of the arena block plus one of the Script struct.
+ *
+ * Vars stay on malloc since their lifetimes are unrelated to any arena. */
 
 typedef struct { char *base; size_t cap, used; } Arena;
 typedef size_t Mark;
@@ -109,32 +98,36 @@ static void arena_init(Arena *a, size_t cap) {
     a->used = 0;
 }
 
-static Mark mark(void) { return g_scratch.used; }
-static void reset_to(Mark m) { g_scratch.used = m; }
-
-static void *sbump(size_t n) {
+static void *arena_bump(Arena *a, size_t n) {
     size_t aligned = (n + 7) & ~(size_t)7;
-    if (g_scratch.used + aligned > g_scratch.cap)
-        die("scratch arena exhausted (wanted %zu, have %zu left)",
-            aligned, g_scratch.cap - g_scratch.used);
-    void *p = g_scratch.base + g_scratch.used;
-    g_scratch.used += aligned;
+    if (a->used + aligned > a->cap)
+        die("arena exhausted (wanted %zu, have %zu left)",
+            aligned, a->cap - a->used);
+    void *p = a->base + a->used;
+    a->used += aligned;
     return p;
 }
 
-static char *sdup(const char *s) {
+static char *arena_dup(Arena *a, const char *s) {
     size_t n = strlen(s) + 1;
-    char *p = sbump(n);
+    char *p = arena_bump(a, n);
     memcpy(p, s, n);
     return p;
 }
 
-static char *sndup(const char *s, size_t n) {
-    char *p = sbump(n + 1);
+static char *arena_ndup(Arena *a, const char *s, size_t n) {
+    char *p = arena_bump(a, n + 1);
     memcpy(p, s, n);
     p[n] = 0;
     return p;
 }
+
+static Mark mark(void) { return g_scratch.used; }
+static void reset_to(Mark m) { g_scratch.used = m; }
+
+static void *sbump(size_t n) { return arena_bump(&g_scratch, n); }
+static char *sdup(const char *s) { return arena_dup(&g_scratch, s); }
+static char *sndup(const char *s, size_t n) { return arena_ndup(&g_scratch, s, n); }
 
 /* Scratch-backed growable buffer. Grow by reallocating a bigger block in the
  * arena; the old block becomes dead weight reclaimed at the next reset. */
@@ -162,14 +155,39 @@ static void sbuf_putn(SBuf *b, const char *s, size_t n) { sbuf_reserve(b, n); me
 /* variables                                                       */
 /* --------------------------------------------------------------- */
 
-typedef struct Var { char *name_lc; char *value; struct Var *next; } Var;
+/* Var values get updated a LOT (inner game loops do set/a on counters). Keep
+ * a small inline buffer so short values never touch the heap, and reuse the
+ * heap buffer across updates once we've grown one. Typical workload: after
+ * warm-up, var_set does zero allocs. */
+enum { VAR_INLINE_CAP = 56 };
+typedef struct Var {
+    char *name_lc;
+    char *value;          /* points to inline_buf OR to a heap buffer */
+    size_t val_cap;       /* capacity of the buffer value currently points to */
+    struct Var *next;
+    char inline_buf[VAR_INLINE_CAP];
+} Var;
 static Var *g_vars = NULL;
+static Var *g_var_free = NULL;      /* recycled structs from var_unset */
+static Arena g_var_arena;           /* Var structs + name_lc strings */
 
 static void name_lower(const char *name, char *out, size_t cap) {
     size_t n = strlen(name);
     if (n + 1 > cap) n = cap - 1;
     for (size_t i = 0; i < n; i++) out[i] = lc((unsigned char)name[i]);
     out[n] = 0;
+}
+
+static void var_write(Var *v, const char *value) {
+    size_t need = strlen(value) + 1;
+    if (need > v->val_cap) {
+        size_t nc = v->val_cap ? v->val_cap * 2 : VAR_INLINE_CAP;
+        while (nc < need) nc *= 2;
+        if (v->value == v->inline_buf) v->value = xmalloc(nc);
+        else v->value = xrealloc(v->value, nc);
+        v->val_cap = nc;
+    }
+    memcpy(v->value, value, need);
 }
 
 static const char *var_get(const char *name) {
@@ -186,7 +204,11 @@ static void var_unset(const char *name) {
         if (strcmp((*pp)->name_lc, key) == 0) {
             Var *v = *pp;
             *pp = v->next;
-            free(v->name_lc); free(v->value); free(v);
+            if (v->value != v->inline_buf) free(v->value);
+            v->value = v->inline_buf;
+            v->val_cap = sizeof v->inline_buf;
+            v->next = g_var_free;
+            g_var_free = v;
             return;
         }
         pp = &(*pp)->next;
@@ -197,13 +219,16 @@ static void var_set(const char *name, const char *value) {
     if (!value || !*value) { var_unset(name); return; }
     char key[128]; name_lower(name, key, sizeof key);
     for (Var *v = g_vars; v; v = v->next) {
-        if (strcmp(v->name_lc, key) == 0) {
-            free(v->value); v->value = xstrdup(value); return;
-        }
+        if (strcmp(v->name_lc, key) == 0) { var_write(v, value); return; }
     }
-    Var *v = xmalloc(sizeof *v);
-    v->name_lc = xstrdup(key);
-    v->value = xstrdup(value);
+    Var *v;
+    if (g_var_free) { v = g_var_free; g_var_free = v->next; }
+    else v = arena_bump(&g_var_arena, sizeof *v);
+    v->name_lc = arena_dup(&g_var_arena, key);
+    v->value = v->inline_buf;
+    v->val_cap = sizeof v->inline_buf;
+    v->inline_buf[0] = 0;
+    var_write(v, value);
     v->next = g_vars;
     g_vars = v;
 }
@@ -239,6 +264,7 @@ typedef struct Script {
     char **lbl_name;     /* lowercased labels */
     int *lbl_stmt;       /* stmt index of the label line */
     int nlabels;
+    Arena arena;         /* owns path + stmts text + label names + arrays */
 } Script;
 
 /* Count paren depth change, ignoring quoted strings and ^-escapes. */
@@ -256,33 +282,48 @@ static int paren_delta(const char *s) {
     return d;
 }
 
-static char *slurp(const char *path, size_t *olen) {
+/* Grow an arena-backed pointer array: allocate a doubled-size block, copy,
+ * return the new base. Old block becomes dead slack in the arena. */
+static void *grow_ptr_array(Arena *a, void *old, int old_cap, int new_cap, size_t elem) {
+    void *nb = arena_bump(a, (size_t)new_cap * elem);
+    if (old_cap > 0) memcpy(nb, old, (size_t)old_cap * elem);
+    return nb;
+}
+
+static Script *script_load(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     if (sz < 0) { fclose(f); return NULL; }
     rewind(f);
-    char *buf = xmalloc((size_t)sz + 1);
-    size_t n = fread(buf, 1, (size_t)sz, f);
+    size_t len = (size_t)sz;
+
+    /* One allocation for the whole Script lifetime: Script struct, source
+     * text, path, stmt strings, label names, pointer arrays. Sized so stmt
+     * storage + regrowth slack fits comfortably. */
+    size_t arena_cap = sizeof(Script) + 16 + (len + 1) + len * 8 + 64 * 1024;
+    char *block = xmalloc(arena_cap);
+    Script *s = (Script *)block;
+    s->arena.base = block;
+    s->arena.cap = arena_cap;
+    s->arena.used = (sizeof(Script) + 7) & ~(size_t)7;
+
+    char *text = arena_bump(&s->arena, len + 1);
+    size_t n = fread(text, 1, len, f);
     fclose(f);
-    buf[n] = 0;
-    if (olen) *olen = n;
-    return buf;
-}
+    text[n] = 0;
+    len = n;
 
-static Script *script_load(const char *path) {
-    size_t len;
-    char *text = slurp(path, &len);
-    if (!text) return NULL;
-
-    Script *s = xmalloc(sizeof *s);
-    s->path = xstrdup(path);
+    s->path = arena_dup(&s->arena, path);
     s->stmts = NULL; s->nstmts = 0;
     s->lbl_name = NULL; s->lbl_stmt = NULL; s->nlabels = 0;
 
     int scap = 0, lcap = 0;
-    Buf cur; buf_init(&cur);
+
+    /* Multi-line statement accumulator in scratch. Reclaimed at end of load. */
+    Mark save = mark();
+    SBuf cur; sbuf_init(&cur);
     int depth = 0;
 
     size_t i = 0;
@@ -292,8 +333,10 @@ static Script *script_load(const char *path) {
         size_t end = i;
         if (end > start && text[end-1] == '\r') end--;
         if (i < len) i++;
-
-        char *line = xstrndup(text + start, end - start);
+        /* NUL-terminate the line in place (text[end] was '\r', '\n', or the
+         * slurp-appended 0); we're done reading before `end` from here on. */
+        text[end] = 0;
+        char *line = text + start;
 
         if (depth == 0) {
             char *t = line;
@@ -303,38 +346,50 @@ static Script *script_load(const char *path) {
                 char *q = t + 1;
                 char *e = q;
                 while (*e && !isspace((unsigned char)*e)) e++;
-                size_t nlen = (size_t)(e - q);
-                char *name = xstrndup(q, nlen);
-                for (char *p = name; *p; p++) *p = lc((unsigned char)*p);
-                if (s->nlabels >= lcap) { lcap = lcap ? lcap*2 : 16; s->lbl_name = xrealloc(s->lbl_name, lcap * sizeof *s->lbl_name); s->lbl_stmt = xrealloc(s->lbl_stmt, lcap * sizeof *s->lbl_stmt); }
-                s->lbl_name[s->nlabels] = name;
+                for (char *p = q; p < e; p++) *p = lc((unsigned char)*p);
+                if (s->nlabels >= lcap) {
+                    int nc = lcap ? lcap * 2 : 16;
+                    s->lbl_name = grow_ptr_array(&s->arena, s->lbl_name, lcap, nc, sizeof *s->lbl_name);
+                    s->lbl_stmt = grow_ptr_array(&s->arena, s->lbl_stmt, lcap, nc, sizeof *s->lbl_stmt);
+                    lcap = nc;
+                }
+                s->lbl_name[s->nlabels] = arena_ndup(&s->arena, q, (size_t)(e - q));
                 s->lbl_stmt[s->nlabels] = s->nstmts;
                 s->nlabels++;
-                if (s->nstmts >= scap) { scap = scap ? scap*2 : 64; s->stmts = xrealloc(s->stmts, scap * sizeof *s->stmts); }
-                s->stmts[s->nstmts++] = xstrdup(line);
-                free(line);
+                if (s->nstmts >= scap) {
+                    int nc = scap ? scap * 2 : 64;
+                    s->stmts = grow_ptr_array(&s->arena, s->stmts, scap, nc, sizeof *s->stmts);
+                    scap = nc;
+                }
+                s->stmts[s->nstmts++] = arena_dup(&s->arena, line);
                 continue;
             }
         }
 
-        if (cur.len > 0) buf_putc(&cur, '\n');
-        buf_puts(&cur, line);
+        if (cur.len > 0) sbuf_putc(&cur, '\n');
+        sbuf_puts(&cur, line);
         depth += paren_delta(line);
         if (depth < 0) depth = 0;
 
         if (depth == 0) {
-            if (s->nstmts >= scap) { scap = scap ? scap*2 : 64; s->stmts = xrealloc(s->stmts, scap * sizeof *s->stmts); }
-            s->stmts[s->nstmts++] = xstrdup(cur.s);
-            buf_reset(&cur);
+            if (s->nstmts >= scap) {
+                int nc = scap ? scap * 2 : 64;
+                s->stmts = grow_ptr_array(&s->arena, s->stmts, scap, nc, sizeof *s->stmts);
+                scap = nc;
+            }
+            s->stmts[s->nstmts++] = arena_ndup(&s->arena, cur.s, cur.len);
+            cur.len = 0; cur.s[0] = 0;
         }
-        free(line);
     }
     if (cur.len > 0) {
-        if (s->nstmts >= scap) { scap = scap ? scap*2 : 64; s->stmts = xrealloc(s->stmts, scap * sizeof *s->stmts); }
-        s->stmts[s->nstmts++] = xstrdup(cur.s);
+        if (s->nstmts >= scap) {
+            int nc = scap ? scap * 2 : 64;
+            s->stmts = grow_ptr_array(&s->arena, s->stmts, scap, nc, sizeof *s->stmts);
+            scap = nc;
+        }
+        s->stmts[s->nstmts++] = arena_ndup(&s->arena, cur.s, cur.len);
     }
-    buf_free(&cur);
-    free(text);
+    reset_to(save);
     return s;
 }
 
@@ -348,12 +403,8 @@ static int script_find_label(Script *s, const char *lbl) {
 
 static void script_free(Script *s) {
     if (!s) return;
-    for (int i = 0; i < s->nstmts; i++) free(s->stmts[i]);
-    free(s->stmts);
-    for (int i = 0; i < s->nlabels; i++) free(s->lbl_name[i]);
-    free(s->lbl_name); free(s->lbl_stmt);
-    free(s->path);
-    free(s);
+    /* Script struct lives at the start of the arena block. */
+    free(s->arena.base);
 }
 
 /* --------------------------------------------------------------- */
@@ -835,10 +886,28 @@ static char *path_norm(const char *p) {
     return r;
 }
 
+/* Map Windows media paths onto local bundled wavs.
+ *   c:\windows\media\NAME.wav  ->  media/NAME.wav   (relative to cwd)
+ * Returns an arena-allocated local path, or NULL if the input isn't under
+ * the c:\windows\media\ tree. Case-insensitive on the prefix. */
+static char *map_media_path(const char *p) {
+    char *n = path_norm(p);
+    const char *prefix = "c:/windows/media/";
+    size_t pl = strlen(prefix);
+    if (!strnieq(n, prefix, pl)) return NULL;
+    SBuf b; sbuf_init(&b);
+    sbuf_puts(&b, "media/");
+    sbuf_puts(&b, n + pl);
+    return b.s;
+}
+
 static int file_exists(const char *path) {
     struct stat st;
     char *np = path_norm(path);
-    return (stat(np, &st) == 0);
+    if (stat(np, &st) == 0) return 1;
+    char *m = map_media_path(path);
+    if (m && stat(m, &st) == 0) return 1;
+    return 0;
 }
 
 /* mkdir -p for the parent directory of path. Ignores errors; best-effort. */
@@ -1527,8 +1596,33 @@ static int call_internal_or_external(const char *target, char **argv, int argc) 
         g_errorlevel = rc;
         return rc;
     }
-    if (strieq(target, "start") || strieq(target, "debug") ||
-        strieq(target, "sndrec32")) { g_errorlevel = 0; return 0; }
+    if (strieq(target, "start")) {
+        /* `start sndrec32 ...` → route to sndrec32 handler below. */
+        if (argc >= 1 && strieq(argv[0], "sndrec32"))
+            return call_internal_or_external("sndrec32", argv + 1, argc - 1);
+        g_errorlevel = 0; return 0;
+    }
+    if (strieq(target, "debug")) { g_errorlevel = 0; return 0; }
+    if (strieq(target, "sndrec32")) {
+        /* Last non-flag arg is the wav path. Try the given path first; if
+         * missing, rewrite via the c:\windows\media\ mapping. */
+        const char *wav = NULL;
+        for (int i = 0; i < argc; i++)
+            if (argv[i][0] != '/') wav = argv[i];
+        if (wav && *wav) {
+            char *path = unquote(wav);
+            struct stat st;
+            char *play = NULL;
+            char *mapped = map_media_path(path);
+            if (mapped && stat(mapped, &st) == 0) play = mapped;
+            else {
+                char *norm = path_norm(path);
+                if (stat(norm, &st) == 0) play = norm;
+            }
+            if (play) audio_play(play);
+        }
+        g_errorlevel = 0; return 0;
+    }
     if (strieq(target, "cmd") || strieq(target, "cmd.exe")) {
         /* cmd /c script args */
         int i = 0;
@@ -1599,18 +1693,17 @@ static int cmd_exit(const char *rest) {
 /* misc built-ins                                                  */
 /* --------------------------------------------------------------- */
 
-typedef struct DirStack { char *path; struct DirStack *next; } DirStack;
-static DirStack *g_dirs = NULL;
+/* pushd/popd is stack-like and shallow in practice. Fixed inline storage
+ * avoids the malloc/free pair per cycle. */
+enum { DIR_STACK_MAX = 32, DIR_STACK_PATHLEN = 4096 };
+static char g_dirs[DIR_STACK_MAX][DIR_STACK_PATHLEN];
+static int g_ndirs = 0;
 
 static int cmd_pushd(const char *rest) {
     while (*rest == ' ' || *rest == '\t') rest++;
-    char cwd[4096];
-    if (!getcwd(cwd, sizeof cwd)) return 1;
-    /* DirStack entries outlive statements — keep them on malloc. */
-    DirStack *d = xmalloc(sizeof *d);
-    d->path = xstrdup(cwd);
-    d->next = g_dirs;
-    g_dirs = d;
+    if (g_ndirs >= DIR_STACK_MAX) { g_errorlevel = 1; return 1; }
+    if (!getcwd(g_dirs[g_ndirs], DIR_STACK_PATHLEN)) return 1;
+    g_ndirs++;
     char *np = path_norm(unquote(rest));
     if (chdir(np) != 0) { g_errorlevel = 1; return 1; }
     return 0;
@@ -1618,10 +1711,8 @@ static int cmd_pushd(const char *rest) {
 
 static int cmd_popd(const char *rest) {
     (void)rest;
-    if (!g_dirs) return 1;
-    DirStack *d = g_dirs; g_dirs = d->next;
-    chdir(d->path);
-    free(d->path); free(d);
+    if (g_ndirs == 0) return 1;
+    chdir(g_dirs[--g_ndirs]);
     return 0;
 }
 
@@ -1832,8 +1923,10 @@ int main(int argc, char **argv) {
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
     signal(SIGINT, on_sigint);
     atexit(tty_cbreak_off);
+    atexit(audio_shutdown);
 
     arena_init(&g_scratch, 4 * 1024 * 1024);
+    arena_init(&g_var_arena, 256 * 1024);
 
     const char *path = argv[1];
     char *resolved = find_script(path);
