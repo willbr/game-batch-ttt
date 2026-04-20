@@ -246,7 +246,6 @@ typedef struct Frame {
     int argc;
     int returning;       /* exit /b fired in this frame */
     int return_code;
-    struct Frame *parent;
 } Frame;
 
 static Frame *g_frame = NULL;
@@ -258,13 +257,12 @@ static volatile sig_atomic_t g_sigint = 0;
 /* --------------------------------------------------------------- */
 
 typedef struct Script {
-    char *path;
     char **stmts;        /* each stmt is one logical statement (may span \n) */
     int nstmts;
     char **lbl_name;     /* lowercased labels */
     int *lbl_stmt;       /* stmt index of the label line */
     int nlabels;
-    Arena arena;         /* owns path + stmts text + label names + arrays */
+    Arena arena;         /* owns stmt text + label names + pointer arrays */
 } Script;
 
 /* Count paren depth change, ignoring quoted strings and ^-escapes. */
@@ -315,7 +313,6 @@ static Script *script_load(const char *path) {
     text[n] = 0;
     len = n;
 
-    s->path = arena_dup(&s->arena, path);
     s->stmts = NULL; s->nstmts = 0;
     s->lbl_name = NULL; s->lbl_stmt = NULL; s->nlabels = 0;
 
@@ -1543,7 +1540,6 @@ static int run_subroutine(const char *label, char **argv, int argc) {
     f.pc = idx;
     f.returning = 0;
     f.return_code = 0;
-    f.parent = g_frame;
     /* args[0] = label string (preserve original case), args[1..] = call args */
     char **args = sbump((size_t)(argc + 1) * sizeof *args);
     SBuf b0; sbuf_init(&b0); sbuf_putc(&b0, ':'); sbuf_puts(&b0, label);
@@ -1552,13 +1548,14 @@ static int run_subroutine(const char *label, char **argv, int argc) {
     f.args = args;
     f.argc = argc + 1;
 
+    Frame *saved = g_frame;
     g_frame = &f;
     while (f.pc < s->nstmts && !f.returning) {
         const char *stmt = s->stmts[f.pc];
         f.pc++;
         execute_stmt(stmt);
     }
-    g_frame = f.parent;
+    g_frame = saved;
     reset_to(m);
     return f.return_code;
 }
@@ -1693,9 +1690,9 @@ static int cmd_exit(const char *rest) {
 /* misc built-ins                                                  */
 /* --------------------------------------------------------------- */
 
-/* pushd/popd is stack-like and shallow in practice. Fixed inline storage
- * avoids the malloc/free pair per cycle. */
-enum { DIR_STACK_MAX = 32, DIR_STACK_PATHLEN = 4096 };
+/* pushd/popd is stack-like and shallow in practice (tictactoe reaches depth 1).
+ * Fixed inline storage avoids malloc/free per cycle. */
+enum { DIR_STACK_MAX = 8, DIR_STACK_PATHLEN = 1024 };
 static char g_dirs[DIR_STACK_MAX][DIR_STACK_PATHLEN];
 static int g_ndirs = 0;
 
@@ -1899,7 +1896,6 @@ static int execute_script(Script *s, char **args, int argc) {
     f.argc = argc;
     f.returning = 0;
     f.return_code = 0;
-    f.parent = g_frame;
     Frame *saved = g_frame;
     g_frame = &f;
     while (f.pc < s->nstmts && !f.returning) {
@@ -1926,7 +1922,7 @@ int main(int argc, char **argv) {
     atexit(audio_shutdown);
 
     arena_init(&g_scratch, 4 * 1024 * 1024);
-    arena_init(&g_var_arena, 256 * 1024);
+    arena_init(&g_var_arena, 64 * 1024);
 
     const char *path = argv[1];
     char *resolved = find_script(path);

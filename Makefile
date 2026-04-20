@@ -10,15 +10,15 @@ AUDIO_LIBS := -lm -ldl -lpthread
 endif
 
 # Windows-media sounds mapped to macOS system sounds. afconvert ships with macOS.
+# Only the names the shipped scripts actually reference:
+#   main.cmd  -> tada
+#   song.txt  -> recycle start chimes notify
 MEDIA_MAP := \
 	tada=Hero \
 	recycle=Pop \
 	start=Ping \
 	chimes=Glass \
-	notify=Tink \
-	ding=Tink \
-	chord=Glass \
-	ringout=Funk
+	notify=Tink
 
 MEDIA_DIR := bin/media
 MEDIA_WAVS := $(foreach m,$(MEDIA_MAP),$(MEDIA_DIR)/$(firstword $(subst =, ,$(m))).wav)
