@@ -13,6 +13,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -68,7 +69,8 @@ static void trim_right(char *s) {
     while (n && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r')) s[--n] = 0;
 }
 
-/* Growable byte buffer. */
+/* Malloc-backed growable byte buffer. Used during script load to build up
+ * statement text (owned by Script, so needs malloc lifetime). */
 typedef struct { char *s; size_t len, cap; } Buf;
 static void buf_init(Buf *b) { b->cap = 64; b->len = 0; b->s = xmalloc(b->cap); b->s[0] = 0; }
 static void buf_free(Buf *b) { free(b->s); b->s = NULL; }
@@ -81,8 +83,80 @@ static void buf_reserve(Buf *b, size_t extra) {
 }
 static void buf_putc(Buf *b, char c) { buf_reserve(b, 1); b->s[b->len++] = c; b->s[b->len] = 0; }
 static void buf_puts(Buf *b, const char *s) { size_t n = strlen(s); buf_reserve(b, n); memcpy(b->s + b->len, s, n); b->len += n; b->s[b->len] = 0; }
-static void buf_putn(Buf *b, const char *s, size_t n) { buf_reserve(b, n); memcpy(b->s + b->len, s, n); b->len += n; b->s[b->len] = 0; }
-static char *buf_take(Buf *b) { char *r = b->s; b->s = NULL; b->len = b->cap = 0; return r; }
+
+/* --------------------------------------------------------------- */
+/* scratch arena                                                   */
+/* --------------------------------------------------------------- */
+
+/* Bump allocator with mark/reset. All transient per-statement strings live
+ * here (expansion results, tokens, split pieces, temporary paths). Frame
+ * args live here too, below the per-statement marks.
+ *
+ * execute_stmt takes a mark on entry and resets on exit. Nested calls nest
+ * their marks naturally — exactly the call-stack lifetime discipline.
+ *
+ * Vars and Script stay on malloc: their lifetimes don't match statement
+ * scope, so forcing them into the arena would just leak. */
+
+typedef struct { char *base; size_t cap, used; } Arena;
+typedef size_t Mark;
+
+static Arena g_scratch;
+
+static void arena_init(Arena *a, size_t cap) {
+    a->base = xmalloc(cap);
+    a->cap = cap;
+    a->used = 0;
+}
+
+static Mark mark(void) { return g_scratch.used; }
+static void reset_to(Mark m) { g_scratch.used = m; }
+
+static void *sbump(size_t n) {
+    size_t aligned = (n + 7) & ~(size_t)7;
+    if (g_scratch.used + aligned > g_scratch.cap)
+        die("scratch arena exhausted (wanted %zu, have %zu left)",
+            aligned, g_scratch.cap - g_scratch.used);
+    void *p = g_scratch.base + g_scratch.used;
+    g_scratch.used += aligned;
+    return p;
+}
+
+static char *sdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *p = sbump(n);
+    memcpy(p, s, n);
+    return p;
+}
+
+static char *sndup(const char *s, size_t n) {
+    char *p = sbump(n + 1);
+    memcpy(p, s, n);
+    p[n] = 0;
+    return p;
+}
+
+/* Scratch-backed growable buffer. Grow by reallocating a bigger block in the
+ * arena; the old block becomes dead weight reclaimed at the next reset. */
+typedef struct { char *s; size_t len, cap; } SBuf;
+
+static void sbuf_init(SBuf *b) {
+    b->cap = 64; b->len = 0;
+    b->s = sbump(b->cap);
+    b->s[0] = 0;
+}
+static void sbuf_reserve(SBuf *b, size_t extra) {
+    if (b->len + extra + 1 <= b->cap) return;
+    size_t newcap = b->cap;
+    while (b->len + extra + 1 > newcap) newcap *= 2;
+    char *nb = sbump(newcap);
+    memcpy(nb, b->s, b->len + 1);
+    b->s = nb;
+    b->cap = newcap;
+}
+static void sbuf_putc(SBuf *b, char c) { sbuf_reserve(b, 1); b->s[b->len++] = c; b->s[b->len] = 0; }
+static void sbuf_puts(SBuf *b, const char *s) { size_t n = strlen(s); sbuf_reserve(b, n); memcpy(b->s + b->len, s, n); b->len += n; b->s[b->len] = 0; }
+static void sbuf_putn(SBuf *b, const char *s, size_t n) { sbuf_reserve(b, n); memcpy(b->s + b->len, s, n); b->len += n; b->s[b->len] = 0; }
 
 /* --------------------------------------------------------------- */
 /* variables                                                       */
@@ -302,7 +376,7 @@ static const char *var_lookup_any(const char *name, char *scratch, size_t cap) {
     return NULL;
 }
 
-static void emit_sub(Buf *b, const char *v, long start, long len, int has_len) {
+static void emit_sub(SBuf *b, const char *v, long start, long len, int has_len) {
     long n = (long)strlen(v);
     if (start < 0) { start = n + start; if (start < 0) start = 0; }
     if (start > n) start = n;
@@ -311,16 +385,17 @@ static void emit_sub(Buf *b, const char *v, long start, long len, int has_len) {
     if (has_len && len < 0) take = rem + len;
     if (take < 0) take = 0;
     if (take > rem) take = rem;
-    buf_putn(b, v + start, (size_t)take);
+    sbuf_putn(b, v + start, (size_t)take);
 }
 
-/* Expand %var% / !var! / %N / %* / %~N / %% / ^ escapes. */
+/* Expand %var% / !var! / %N / %* / %~N / %% / ^ escapes. Result lives in
+ * the scratch arena. */
 static char *expand(const char *in) {
-    Buf out; buf_init(&out);
-    char scratch[64];
+    SBuf out; sbuf_init(&out);
+    char scratch[PATH_MAX > 1024 ? PATH_MAX : 1024];
 
     for (const char *p = in; *p; ) {
-        if (*p == '^' && p[1]) { buf_putc(&out, p[1]); p += 2; continue; }
+        if (*p == '^' && p[1]) { sbuf_putc(&out, p[1]); p += 2; continue; }
 
         /* %...% : check %* / %~N / %N first, then scan greedily for closing %.
          * An empty name between two adjacent %'s means the literal %% escape. */
@@ -328,8 +403,8 @@ static char *expand(const char *in) {
             if (p[1] == '*') {
                 if (g_frame) {
                     for (int i = 1; i < g_frame->argc; i++) {
-                        if (i > 1) buf_putc(&out, ' ');
-                        buf_puts(&out, g_frame->args[i]);
+                        if (i > 1) sbuf_putc(&out, ' ');
+                        sbuf_puts(&out, g_frame->args[i]);
                     }
                 }
                 p += 2; continue;
@@ -340,25 +415,25 @@ static char *expand(const char *in) {
                 if (g_frame && n < g_frame->argc) {
                     const char *a = g_frame->args[n];
                     size_t al = strlen(a);
-                    if (al >= 2 && a[0] == '"' && a[al-1] == '"') buf_putn(&out, a+1, al-2);
-                    else buf_puts(&out, a);
+                    if (al >= 2 && a[0] == '"' && a[al-1] == '"') sbuf_putn(&out, a+1, al-2);
+                    else sbuf_puts(&out, a);
                 }
                 continue;
             }
             if (p[1] >= '0' && p[1] <= '9') {
                 int n = p[1] - '0';
                 p += 2;
-                if (g_frame && n < g_frame->argc) buf_puts(&out, g_frame->args[n]);
+                if (g_frame && n < g_frame->argc) sbuf_puts(&out, g_frame->args[n]);
                 continue;
             }
             const char *q = p + 1;
             const char *end = NULL;
             while (*q) { if (*q == '%') { end = q; break; } q++; }
-            if (!end) { buf_putc(&out, '%'); p++; continue; }
+            if (!end) { sbuf_putc(&out, '%'); p++; continue; }
             size_t raw_nlen = (size_t)(end - (p + 1));
             if (raw_nlen == 0) {
                 /* %% -- escape to single literal % */
-                buf_putc(&out, '%');
+                sbuf_putc(&out, '%');
                 p = end + 1;
                 continue;
             }
@@ -378,10 +453,10 @@ static char *expand(const char *in) {
                     if (*m == ',') { m++; lv = strtol(m, &me, 10); hl = 1; }
                     emit_sub(&out, val, sv, lv, hl);
                 } else {
-                    buf_puts(&out, val);
+                    sbuf_puts(&out, val);
                 }
             } else if (val) {
-                buf_puts(&out, val);
+                sbuf_puts(&out, val);
             }
             p = end + 1;
             continue;
@@ -392,7 +467,7 @@ static char *expand(const char *in) {
             const char *q = p + 1;
             const char *end = NULL;
             while (*q) { if (*q == '!') { end = q; break; } q++; }
-            if (!end) { buf_putc(&out, '!'); p++; continue; }
+            if (!end) { sbuf_putc(&out, '!'); p++; continue; }
             const char *colon = NULL;
             for (const char *r = p + 1; r < end; r++) if (*r == ':') { colon = r; break; }
             size_t nlen = (colon ? colon : end) - (p + 1);
@@ -409,19 +484,19 @@ static char *expand(const char *in) {
                     if (*m == ',') { m++; lv = strtol(m, &me, 10); hl = 1; }
                     emit_sub(&out, val, sv, lv, hl);
                 } else {
-                    buf_puts(&out, val);
+                    sbuf_puts(&out, val);
                 }
             } else if (val) {
-                buf_puts(&out, val);
+                sbuf_puts(&out, val);
             }
             p = end + 1;
             continue;
         }
 
-        buf_putc(&out, *p);
+        sbuf_putc(&out, *p);
         p++;
     }
-    return buf_take(&out);
+    return out.s;
 }
 
 /* --------------------------------------------------------------- */
@@ -529,11 +604,11 @@ static long eval_expr(const char *e) { Lex L = { e }; return parse_expr(&L); }
 /* command-line helpers                                            */
 /* --------------------------------------------------------------- */
 
-/* Split s on top-level '&' or '\n'. Fills out[] with owned strdup'd strings.
+/* Split s on top-level '&' or '\n'. Fills out[] with arena-allocated strings.
  * Skips '&' when it's part of a redirection like `>&N` or `2>&N`. */
 static int split_seq(const char *s, char ***out) {
     int cap = 4, n = 0;
-    char **v = xmalloc(cap * sizeof *v);
+    char **v = sbump(cap * sizeof *v);
     const char *start = s;
     int d = 0, q = 0;
     for (const char *p = s; ; p++) {
@@ -558,8 +633,13 @@ static int split_seq(const char *s, char ***out) {
         }
         if (at_end || split_here) {
             size_t L = (size_t)(p - start);
-            char *t = xstrndup(start, L);
-            if (n >= cap) { cap *= 2; v = xrealloc(v, cap * sizeof *v); }
+            char *t = sndup(start, L);
+            if (n >= cap) {
+                int ncap = cap * 2;
+                char **nv = sbump(ncap * sizeof *nv);
+                memcpy(nv, v, n * sizeof *v);
+                v = nv; cap = ncap;
+            }
             v[n++] = t;
             if (at_end) break;
             start = p + 1;
@@ -569,9 +649,9 @@ static int split_seq(const char *s, char ***out) {
     return n;
 }
 
-/* Peel off a leading parenthesized block "(...)" from s.
- * On success, returns newly allocated body string (without outer parens),
- * and writes rest pointer into *rest_out. Returns NULL if s doesn't start with '('. */
+/* Peel off a leading parenthesized block "(...)" from s. On success, returns
+ * an arena-allocated body string (without outer parens) and writes rest
+ * pointer into *rest_out. Returns NULL if s doesn't start with '('. */
 static char *peel_paren(const char *s, const char **rest_out) {
     while (*s == ' ' || *s == '\t') s++;
     if (*s != '(') return NULL;
@@ -588,7 +668,7 @@ static char *peel_paren(const char *s, const char **rest_out) {
         p++;
     }
     if (d != 0) return NULL;
-    char *body = xstrndup(body_start, (size_t)(p - body_start));
+    char *body = sndup(body_start, (size_t)(p - body_start));
     *rest_out = (*p == ')') ? p + 1 : p;
     return body;
 }
@@ -655,8 +735,7 @@ static int apply_redir(char *line, RedirSaved *saved) {
                     fe++;
                 }
                 size_t fl = (size_t)(fe - q2);
-                free(err_file);
-                err_file = xstrndup(q2, fl);
+                err_file = sndup(q2, fl);
                 /* strip quotes */
                 if (fl >= 2 && err_file[0] == '"' && err_file[fl-1] == '"') {
                     memmove(err_file, err_file + 1, fl - 2);
@@ -677,8 +756,7 @@ static int apply_redir(char *line, RedirSaved *saved) {
                     fe++;
                 }
                 size_t fl = (size_t)(fe - q2);
-                free(out_file);
-                out_file = xstrndup(q2, fl);
+                out_file = sndup(q2, fl);
                 if (fl >= 2 && out_file[0] == '"' && out_file[fl-1] == '"') {
                     memmove(out_file, out_file + 1, fl - 2);
                     out_file[fl - 2] = 0;
@@ -709,21 +787,18 @@ static int apply_redir(char *line, RedirSaved *saved) {
 
     if (out_file) {
         int nul = strieq(out_file, "nul");
-        char *np = nul ? xstrdup("/dev/null") : path_norm(out_file);
+        char *np = nul ? sdup("/dev/null") : path_norm(out_file);
         if (!nul) ensure_parent_dir(np);
-        const char *path = np;
-        int fd = open(path, O_WRONLY | O_CREAT | (out_append ? O_APPEND : O_TRUNC), 0644);
+        int fd = open(np, O_WRONLY | O_CREAT | (out_append ? O_APPEND : O_TRUNC), 0644);
         if (fd >= 0) {
             saved->saved_stdout = dup(1);
             dup2(fd, 1);
             close(fd);
         }
-        free(np);
-        free(out_file);
     }
     if (err_file) {
         int nul = strieq(err_file, "nul");
-        char *np = nul ? xstrdup("/dev/null") : path_norm(err_file);
+        char *np = nul ? sdup("/dev/null") : path_norm(err_file);
         if (!nul) ensure_parent_dir(np);
         int fd = open(np, O_WRONLY | O_CREAT | (err_append ? O_APPEND : O_TRUNC), 0644);
         if (fd >= 0) {
@@ -731,8 +806,6 @@ static int apply_redir(char *line, RedirSaved *saved) {
             dup2(fd, 2);
             close(fd);
         }
-        free(np);
-        free(err_file);
     }
     if (dup_err_to_out) {
         if (saved->saved_stderr < 0) saved->saved_stderr = dup(2);
@@ -755,9 +828,9 @@ static void restore_redir(RedirSaved *saved) {
 /* path helpers                                                    */
 /* --------------------------------------------------------------- */
 
-/* Normalize backslashes in path -> forward slashes (copy). */
+/* Normalize backslashes in path -> forward slashes. Returns arena copy. */
 static char *path_norm(const char *p) {
-    char *r = xstrdup(p);
+    char *r = sdup(p);
     for (char *q = r; *q; q++) if (*q == '\\') *q = '/';
     return r;
 }
@@ -765,14 +838,12 @@ static char *path_norm(const char *p) {
 static int file_exists(const char *path) {
     struct stat st;
     char *np = path_norm(path);
-    int ok = (stat(np, &st) == 0);
-    free(np);
-    return ok;
+    return (stat(np, &st) == 0);
 }
 
 /* mkdir -p for the parent directory of path. Ignores errors; best-effort. */
 static void ensure_parent_dir(const char *path) {
-    char *p = xstrdup(path);
+    char *p = sdup(path);
     /* strip trailing slashes */
     size_t n = strlen(p);
     while (n && (p[n-1] == '/' || p[n-1] == '\\')) p[--n] = 0;
@@ -784,21 +855,18 @@ static void ensure_parent_dir(const char *path) {
             *q = c;
         }
     }
-    free(p);
 }
 
-/* Try find script file by name: name, name.cmd, name.bat in cwd and in
- * dirname(argv0-equivalent). Returns newly-allocated path or NULL. */
+/* Try find script file by name: name, name.cmd, name.bat in cwd. Returns
+ * arena-allocated path or NULL. */
 static char *find_script(const char *name) {
     char *norm = path_norm(name);
     const char *exts[] = { "", ".cmd", ".bat", NULL };
     for (int i = 0; exts[i]; i++) {
-        Buf b; buf_init(&b);
-        buf_puts(&b, norm); buf_puts(&b, exts[i]);
-        if (file_exists(b.s)) { free(norm); return buf_take(&b); }
-        buf_free(&b);
+        SBuf b; sbuf_init(&b);
+        sbuf_puts(&b, norm); sbuf_puts(&b, exts[i]);
+        if (file_exists(b.s)) return b.s;
     }
-    free(norm);
     return NULL;
 }
 
@@ -864,36 +932,36 @@ static int fake_ping(int argc, char **argv) {
 
 static int tok_argv(const char *s, char ***out) {
     int cap = 4, n = 0;
-    char **v = xmalloc(cap * sizeof *v);
+    char **v = sbump(cap * sizeof *v);
     while (*s) {
         while (*s == ' ' || *s == '\t') s++;
         if (!*s) break;
-        Buf b; buf_init(&b);
+        SBuf b; sbuf_init(&b);
         int q = 0;
         while (*s) {
-            if (*s == '^' && s[1]) { buf_putc(&b, s[1]); s += 2; continue; }
-            if (*s == '"') { q = !q; buf_putc(&b, '"'); s++; continue; }
+            if (*s == '^' && s[1]) { sbuf_putc(&b, s[1]); s += 2; continue; }
+            if (*s == '"') { q = !q; sbuf_putc(&b, '"'); s++; continue; }
             if (!q && (*s == ' ' || *s == '\t')) break;
-            buf_putc(&b, *s);
+            sbuf_putc(&b, *s);
             s++;
         }
-        if (n >= cap) { cap *= 2; v = xrealloc(v, cap * sizeof *v); }
-        v[n++] = buf_take(&b);
+        if (n >= cap) {
+            int ncap = cap * 2;
+            char **nv = sbump(ncap * sizeof *nv);
+            memcpy(nv, v, n * sizeof *v);
+            v = nv; cap = ncap;
+        }
+        v[n++] = b.s;
     }
     *out = v;
     return n;
 }
 
-static void free_argv(char **v, int n) {
-    for (int i = 0; i < n; i++) free(v[i]);
-    free(v);
-}
-
-/* Strip surrounding "..." from an arg (in-place copy). */
+/* Strip surrounding "..." from an arg. Returns arena copy. */
 static char *unquote(const char *s) {
     size_t n = strlen(s);
-    if (n >= 2 && s[0] == '"' && s[n-1] == '"') return xstrndup(s + 1, n - 2);
-    return xstrdup(s);
+    if (n >= 2 && s[0] == '"' && s[n-1] == '"') return sndup(s + 1, n - 2);
+    return sdup(s);
 }
 
 /* --------------------------------------------------------------- */
@@ -932,7 +1000,7 @@ static int cmd_set(const char *rest) {
         while (*rest == ' ' || *rest == '\t') rest++;
         const char *eq = strchr(rest, '=');
         if (!eq) return 0;
-        char *name = xstrndup(rest, (size_t)(eq - rest));
+        char *name = sndup(rest, (size_t)(eq - rest));
         /* trim name */
         trim_right(name);
         char *nm = trim_left(name);
@@ -940,10 +1008,8 @@ static int cmd_set(const char *rest) {
         const char *prompt = eq + 1;
         char *up = unquote(prompt);
         fputs(up, stdout); fflush(stdout);
-        free(up);
         /* don't read -- stdin is assumed piped to nul */
         var_set(nm, "");
-        free(name);
         return 0;
     }
     if (slash_a) {
@@ -962,11 +1028,10 @@ static int cmd_set(const char *rest) {
     /* trim trailing ws before '=' */
     while (name_end > rest && (name_end[-1] == ' ' || name_end[-1] == '\t')) name_end--;
     if (name_end == rest) return 0;
-    char *name = xstrndup(rest, (size_t)(name_end - rest));
+    char *name = sndup(rest, (size_t)(name_end - rest));
     const char *val = eq + 1;
     /* cmd does NOT trim leading whitespace of value. */
     var_set(name, val);
-    free(name);
     return 0;
 }
 
@@ -974,23 +1039,24 @@ static int cmd_set(const char *rest) {
 /* if                                                              */
 /* --------------------------------------------------------------- */
 
-/* Consume one term of an if condition. Returns the operand string (owned)
- * and advances *pp past it. A term is either a "quoted string" or a bareword. */
+/* Consume one term of an if condition. Returns an arena-allocated operand
+ * string and advances *pp past it. A term is either a "quoted string" or a
+ * bareword. */
 static char *if_term(const char **pp) {
     const char *p = *pp;
     while (*p == ' ' || *p == '\t') p++;
-    if (!*p) { *pp = p; return xstrdup(""); }
+    if (!*p) { *pp = p; return sdup(""); }
     if (*p == '"') {
         const char *q = p + 1;
         while (*q && *q != '"') q++;
         char *r;
-        if (*q == '"') { r = xstrndup(p, (size_t)(q - p + 1)); *pp = q + 1; }
-        else { r = xstrdup(p); *pp = p + strlen(p); }
+        if (*q == '"') { r = sndup(p, (size_t)(q - p + 1)); *pp = q + 1; }
+        else { r = sdup(p); *pp = p + strlen(p); }
         return r;
     }
     const char *q = p;
     while (*q && *q != ' ' && *q != '\t') q++;
-    char *r = xstrndup(p, (size_t)(q - p));
+    char *r = sndup(p, (size_t)(q - p));
     *pp = q;
     return r;
 }
@@ -1003,7 +1069,6 @@ static int both_numeric(const char *a, const char *b, long *ai, long *bi) {
     long vb = strtol(ub, &eb, 10);
     int ok = (*ua && *ea == 0 && *ub && *eb == 0);
     if (ok) { *ai = va; *bi = vb; }
-    free(ua); free(ub);
     return ok;
 }
 
@@ -1011,16 +1076,12 @@ static int str_eq_cmd(const char *a, const char *b) {
     /* cmd's "==" is a literal string comparison; we compare as-given
      * but with surrounding quotes unified. */
     char *ua = unquote(a), *ub = unquote(b);
-    int r = strcmp(ua, ub) == 0;
-    free(ua); free(ub);
-    return r;
+    return strcmp(ua, ub) == 0;
 }
 
 static int str_cmp_cmd(const char *a, const char *b) {
     char *ua = unquote(a), *ub = unquote(b);
-    int r = strcmp(ua, ub);
-    free(ua); free(ub);
-    return r;
+    return strcmp(ua, ub);
 }
 
 /* Evaluate an `if ...` statement. `s` is RAW text (no prior var expansion)
@@ -1041,10 +1102,9 @@ static int eval_if(const char *s) {
         /* N may be an expanded variable, expand just this number */
         const char *e = p;
         while (*e && *e != ' ' && *e != '\t') e++;
-        char *numraw = xstrndup(p, (size_t)(e - p));
+        char *numraw = sndup(p, (size_t)(e - p));
         char *num = expand(numraw);
         long n = strtol(num, NULL, 10);
-        free(num); free(numraw);
         cond = (g_errorlevel >= n);
         body_start = e;
     }
@@ -1054,7 +1114,6 @@ static int eval_if(const char *s) {
         char *exp1 = expand(term);
         char *uq = unquote(exp1);
         cond = file_exists(uq);
-        free(uq); free(exp1); free(term);
         body_start = p;
     }
     else if (strnieq(s, "defined ", 8)) {
@@ -1062,23 +1121,20 @@ static int eval_if(const char *s) {
         char *term = if_term(&p);
         char *exp1 = expand(term);
         cond = (var_get(exp1) != NULL);
-        free(exp1); free(term);
         body_start = p;
     }
     else {
         const char *p = s;
         char *a = if_term(&p);
         char *aexp = expand(a);
-        free(a);
         while (*p == ' ' || *p == '\t') p++;
         int handled = 0;
         if (p[0] == '=' && p[1] == '=') {
             p += 2;
             char *b = if_term(&p);
             char *bexp = expand(b);
-            free(b);
             cond = str_eq_cmd(aexp, bexp);
-            free(bexp); handled = 1;
+            handled = 1;
         } else {
             const char *ops[] = { "EQU", "NEQ", "LSS", "LEQ", "GTR", "GEQ", NULL };
             int which = -1;
@@ -1091,7 +1147,6 @@ static int eval_if(const char *s) {
             if (which >= 0) {
                 char *b = if_term(&p);
                 char *bexp = expand(b);
-                free(b);
                 long ai, bi; int r;
                 if (both_numeric(aexp, bexp, &ai, &bi)) {
                     long d = ai - bi;
@@ -1117,10 +1172,9 @@ static int eval_if(const char *s) {
                     }
                 }
                 cond = r;
-                free(bexp); handled = 1;
+                handled = 1;
             }
         }
-        free(aexp);
         if (!handled) return 0;
         body_start = p;
     }
@@ -1134,11 +1188,11 @@ static int eval_if(const char *s) {
 
     if (*body_start == '(') {
         true_body = peel_paren(body_start, &rest);
-        if (!true_body) true_body = xstrdup("");
+        if (!true_body) true_body = sdup("");
     } else {
         const char *p = body_start;
         while (*p) p++;
-        true_body = xstrndup(body_start, (size_t)(p - body_start));
+        true_body = sndup(body_start, (size_t)(p - body_start));
         rest = p;
     }
     while (*rest == ' ' || *rest == '\t' || *rest == '\n') rest++;
@@ -1149,14 +1203,13 @@ static int eval_if(const char *s) {
             const char *r2;
             false_body = peel_paren(rest, &r2);
         } else {
-            false_body = xstrdup(rest);
+            false_body = sdup(rest);
         }
     }
 
     int rc = 0;
     if (cond) rc = execute_seq(true_body);
     else if (false_body) rc = execute_seq(false_body);
-    free(true_body); free(false_body);
     return rc;
 }
 
@@ -1166,20 +1219,20 @@ static int eval_if(const char *s) {
 
 /* Escape paren-tracking / statement-splitting specials with '^' so the value
  * survives split_seq and peel_paren intact. expand() will consume the ^ later. */
-static void emit_escaped(Buf *out, const char *value) {
+static void emit_escaped(SBuf *out, const char *value) {
     for (const char *v = value; *v; v++) {
         char c = *v;
         if (c == '(' || c == ')' || c == '&' || c == '|' ||
             c == '<' || c == '>' || c == '^') {
-            buf_putc(out, '^');
+            sbuf_putc(out, '^');
         }
-        buf_putc(out, c);
+        sbuf_putc(out, c);
     }
 }
 
 /* Replace every %%X and %X in body with value (textual, escaped). */
 static char *for_subst(const char *body, char var, const char *value) {
-    Buf out; buf_init(&out);
+    SBuf out; sbuf_init(&out);
     for (const char *p = body; *p; ) {
         if (*p == '%' && p[1] == '%' && p[2] == var) {
             emit_escaped(&out, value);
@@ -1191,10 +1244,10 @@ static char *for_subst(const char *body, char var, const char *value) {
             p += 2;
             continue;
         }
-        buf_putc(&out, *p);
+        sbuf_putc(&out, *p);
         p++;
     }
-    return buf_take(&out);
+    return out.s;
 }
 
 /* Execute a FOR statement. `rest` is the text after the leading `for`. */
@@ -1232,21 +1285,20 @@ static int do_for(const char *rest) {
     char *items = peel_paren(rest, &after);
     if (!items) return 0;
     while (*after == ' ' || *after == '\t' || *after == '\n') after++;
-    if (!strnieq(after, "do", 2)) { free(items); return 0; }
+    if (!strnieq(after, "do", 2)) return 0;
     after += 2;
     while (*after == ' ' || *after == '\t' || *after == '\n') after++;
     char *body;
     if (*after == '(') {
         const char *r2;
         body = peel_paren(after, &r2);
-        if (!body) body = xstrdup("");
+        if (!body) body = sdup("");
     } else {
-        body = xstrdup(after);
+        body = sdup(after);
     }
 
     /* Expand vars in the items spec (for /l and /f need expanded path, etc.) */
     char *items_exp = expand(items);
-    free(items);
 
     int rc = 0;
 
@@ -1267,7 +1319,6 @@ static int do_for(const char *rest) {
             char val[32]; snprintf(val, sizeof val, "%ld", i);
             char *body2 = for_subst(body, var, val);
             rc = execute_seq(body2);
-            free(body2);
             if (g_frame && g_frame->returning) break;
         }
     } else if (mode == 2) {
@@ -1279,7 +1330,6 @@ static int do_for(const char *rest) {
         if (pl >= 2 && path[0] == '"' && path[pl-1] == '"') { path[pl-1] = 0; path++; }
         char *np = path_norm(path);
         FILE *f = fopen(np, "rb");
-        free(np);
         /* parse tokens=1,2 etc.  default: tokens=1 */
         int tokens_max = 1;
         if (fopts) {
@@ -1312,21 +1362,18 @@ static int do_for(const char *rest) {
                 while (*tp == ' ' || *tp == '\t') tp++;
                 if (!*tp) continue;
                 /* assign tokens_max tokens to %var, %var+1, ... */
-                char *body2 = xstrdup(body);
+                char *body2 = sdup(body);
                 int k = 0;
                 while (*tp && k < tokens_max) {
                     char *te = tp;
                     while (*te && *te != ' ' && *te != '\t') te++;
-                    char *tok = xstrndup(tp, (size_t)(te - tp));
-                    char *next = for_subst(body2, var + k, tok);
-                    free(body2); body2 = next;
-                    free(tok);
+                    char *tok = sndup(tp, (size_t)(te - tp));
+                    body2 = for_subst(body2, var + k, tok);
                     while (*te == ' ' || *te == '\t') te++;
                     tp = te;
                     k++;
                 }
                 rc = execute_seq(body2);
-                free(body2);
                 if (g_frame && g_frame->returning) break;
             }
             fclose(f);
@@ -1339,17 +1386,14 @@ static int do_for(const char *rest) {
             if (!*p) break;
             const char *e = p;
             while (*e && *e != ' ' && *e != '\t' && *e != ',' && *e != ';') e++;
-            char *val = xstrndup(p, (size_t)(e - p));
+            char *val = sndup(p, (size_t)(e - p));
             char *body2 = for_subst(body, var, val);
             rc = execute_seq(body2);
-            free(body2); free(val);
             p = e;
             if (g_frame && g_frame->returning) break;
         }
     }
 
-    free(items_exp);
-    free(body);
     return rc;
 }
 
@@ -1361,12 +1405,11 @@ static int cmd_goto(const char *rest) {
     while (*rest == ' ' || *rest == '\t') rest++;
     const char *p = rest;
     while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
-    char *label = xstrndup(rest, (size_t)(p - rest));
+    char *label = sndup(rest, (size_t)(p - rest));
     if (label[0] == ':') memmove(label, label + 1, strlen(label)); /* tolerate :label */
-    if (!g_frame) { free(label); return 0; }
+    if (!g_frame) return 0;
     if (strieq(label, "eof")) {
         g_frame->returning = 1;
-        free(label);
         return 0;
     }
     int idx = script_find_label(g_frame->script, label);
@@ -1374,11 +1417,9 @@ static int cmd_goto(const char *rest) {
         fprintf(stderr, "cmd: label not found: %s\n", label);
         g_frame->returning = 1;
         g_errorlevel = 1;
-        free(label);
         return 0;
     }
     g_frame->pc = idx;
-    free(label);
     return 0;
 }
 
@@ -1401,25 +1442,23 @@ static int cmd_call(const char *rest) {
     if (*p == '"') {
         const char *q = p + 1;
         while (*q && *q != '"') q++;
-        target = xstrndup(p + 1, (size_t)(q - (p + 1)));
+        target = sndup(p + 1, (size_t)(q - (p + 1)));
         p = (*q == '"') ? q + 1 : q;
     } else {
         const char *q = p;
         while (*q && *q != ' ' && *q != '\t') q++;
-        target = xstrndup(p, (size_t)(q - p));
+        target = sndup(p, (size_t)(q - p));
         p = q;
     }
 
     char **argv = NULL;
     int argn = tok_argv(p, &argv);
-    int rc = call_internal_or_external(target, argv, argn);
-    free_argv(argv, argn);
-    free(target);
-    free(exp2);
-    return rc;
+    return call_internal_or_external(target, argv, argn);
 }
 
-/* Call an internal-label subroutine (target starts with ':'). */
+/* Call an internal-label subroutine (target starts with ':'). Frame args
+ * live in the arena below this function's mark, so they're reclaimed along
+ * with everything else when the subroutine returns. */
 static int run_subroutine(const char *label, char **argv, int argc) {
     if (!g_frame) return 1;
     Script *s = g_frame->script;
@@ -1429,6 +1468,7 @@ static int run_subroutine(const char *label, char **argv, int argc) {
         g_errorlevel = 1;
         return 1;
     }
+    Mark m = mark();
     Frame f;
     f.script = s;
     f.pc = idx;
@@ -1436,10 +1476,10 @@ static int run_subroutine(const char *label, char **argv, int argc) {
     f.return_code = 0;
     f.parent = g_frame;
     /* args[0] = label string (preserve original case), args[1..] = call args */
-    char **args = xmalloc((size_t)(argc + 1) * sizeof *args);
-    Buf b0; buf_init(&b0); buf_putc(&b0, ':'); buf_puts(&b0, label);
-    args[0] = buf_take(&b0);
-    for (int i = 0; i < argc; i++) args[i + 1] = xstrdup(argv[i]);
+    char **args = sbump((size_t)(argc + 1) * sizeof *args);
+    SBuf b0; sbuf_init(&b0); sbuf_putc(&b0, ':'); sbuf_puts(&b0, label);
+    args[0] = b0.s;
+    for (int i = 0; i < argc; i++) args[i + 1] = sdup(argv[i]);
     f.args = args;
     f.argc = argc + 1;
 
@@ -1450,8 +1490,7 @@ static int run_subroutine(const char *label, char **argv, int argc) {
         execute_stmt(stmt);
     }
     g_frame = f.parent;
-    for (int i = 0; i < f.argc; i++) free(args[i]);
-    free(args);
+    reset_to(m);
     return f.return_code;
 }
 
@@ -1463,12 +1502,12 @@ static int run_script_file(const char *path, char **argv, int argc) {
         g_errorlevel = 1;
         return 1;
     }
-    char **args = xmalloc((size_t)(argc + 1) * sizeof *args);
-    args[0] = xstrdup(path);
-    for (int i = 0; i < argc; i++) args[i + 1] = xstrdup(argv[i]);
+    Mark m = mark();
+    char **args = sbump((size_t)(argc + 1) * sizeof *args);
+    args[0] = sdup(path);
+    for (int i = 0; i < argc; i++) args[i + 1] = sdup(argv[i]);
     int rc = execute_script(s, args, argc + 1);
-    for (int i = 0; i < argc + 1; i++) free(args[i]);
-    free(args);
+    reset_to(m);
     script_free(s);
     return rc;
 }
@@ -1481,12 +1520,10 @@ static int call_internal_or_external(const char *target, char **argv, int argc) 
     if (strieq(target, "reply")) { g_errorlevel = fake_reply(); return g_errorlevel; }
     if (strieq(target, "ping")) {
         /* build argv with "ping" as argv[0] */
-        char **a = xmalloc((size_t)(argc + 1) * sizeof *a);
-        a[0] = xstrdup("ping");
-        for (int i = 0; i < argc; i++) a[i + 1] = xstrdup(argv[i]);
+        char **a = sbump((size_t)(argc + 1) * sizeof *a);
+        a[0] = sdup("ping");
+        for (int i = 0; i < argc; i++) a[i + 1] = argv[i];
         int rc = fake_ping(argc + 1, a);
-        for (int i = 0; i < argc + 1; i++) free(a[i]);
-        free(a);
         g_errorlevel = rc;
         return rc;
     }
@@ -1503,38 +1540,32 @@ static int call_internal_or_external(const char *target, char **argv, int argc) 
         char *path = find_script(name);
         if (!path) { fprintf(stderr, "cmd: not found: %s\n", name); g_errorlevel = 1; return 1; }
         int rc = run_script_file(path, rest, rn);
-        free(path);
         g_errorlevel = rc;
         return rc;
     }
 
     /* single-command internals reachable via call */
     if (strieq(target, "echo")) {
-        Buf b; buf_init(&b);
+        SBuf b; sbuf_init(&b);
         for (int i = 0; i < argc; i++) {
-            if (i) buf_putc(&b, ' ');
-            buf_puts(&b, argv[i]);
+            if (i) sbuf_putc(&b, ' ');
+            sbuf_puts(&b, argv[i]);
         }
-        int rc = cmd_echo(b.s);
-        buf_free(&b);
-        return rc;
+        return cmd_echo(b.s);
     }
     if (strieq(target, "set")) {
-        Buf b; buf_init(&b);
+        SBuf b; sbuf_init(&b);
         for (int i = 0; i < argc; i++) {
-            if (i) buf_putc(&b, ' ');
-            buf_puts(&b, argv[i]);
+            if (i) sbuf_putc(&b, ' ');
+            sbuf_puts(&b, argv[i]);
         }
-        int rc = cmd_set(b.s);
-        buf_free(&b);
-        return rc;
+        return cmd_set(b.s);
     }
 
     /* fall back: find .cmd/.bat and run */
     char *path = find_script(target);
     if (path) {
         int rc = run_script_file(path, argv, argc);
-        free(path);
         g_errorlevel = rc;
         return rc;
     }
@@ -1575,15 +1606,13 @@ static int cmd_pushd(const char *rest) {
     while (*rest == ' ' || *rest == '\t') rest++;
     char cwd[4096];
     if (!getcwd(cwd, sizeof cwd)) return 1;
+    /* DirStack entries outlive statements — keep them on malloc. */
     DirStack *d = xmalloc(sizeof *d);
     d->path = xstrdup(cwd);
     d->next = g_dirs;
     g_dirs = d;
-    char *p = unquote(rest);
-    char *np = path_norm(p);
-    int rc = chdir(np);
-    free(np); free(p);
-    if (rc != 0) { g_errorlevel = 1; return 1; }
+    char *np = path_norm(unquote(rest));
+    if (chdir(np) != 0) { g_errorlevel = 1; return 1; }
     return 0;
 }
 
@@ -1599,20 +1628,16 @@ static int cmd_popd(const char *rest) {
 static int cmd_cd(const char *rest) {
     while (*rest == ' ' || *rest == '\t') rest++;
     if (!*rest) return 0;
-    char *p = unquote(rest);
-    char *np = path_norm(p);
+    char *np = path_norm(unquote(rest));
     int rc = chdir(np);
-    free(np); free(p);
     g_errorlevel = rc ? 1 : 0;
     return rc;
 }
 
 static int cmd_type(const char *rest) {
     while (*rest == ' ' || *rest == '\t') rest++;
-    char *p = unquote(rest);
-    char *np = path_norm(p);
+    char *np = path_norm(unquote(rest));
     FILE *f = fopen(np, "rb");
-    free(np); free(p);
     if (!f) { g_errorlevel = 1; return 1; }
     char buf[4096];
     size_t n;
@@ -1648,11 +1673,8 @@ static int run_simple(const char *s) {
         if (c == '.' || c == ':' || c == ';' || c == ',' || c == '/' ||
             c == '\\' || c == '+' || c == '=' || c == '[' || c == ']') {
             /* print the text after "echo<c>" plus whatever came after */
-            Buf b; buf_init(&b);
-            buf_puts(&b, name + 5);
-            if (*rest) { buf_putc(&b, ' '); buf_puts(&b, rest); }
-            printf("%s\n", b.s);
-            buf_free(&b);
+            if (*rest) printf("%s %s\n", name + 5, rest);
+            else printf("%s\n", name + 5);
             return 0;
         }
     }
@@ -1681,7 +1703,6 @@ static int run_simple(const char *s) {
     char **argv = NULL;
     int argn = tok_argv(rest, &argv);
     int rc = call_internal_or_external(name, argv, argn);
-    free_argv(argv, argn);
     g_errorlevel = rc;
     return rc;
 }
@@ -1704,31 +1725,32 @@ static const char *peek_word(const char *s, char *out, size_t cap) {
 static int execute_stmt(const char *raw) {
     if (g_frame && g_frame->returning) return 0;
 
+    /* Snapshot the arena on entry; everything allocated while we run this
+     * statement is reclaimed when we reset. Nested execute_stmt / execute_seq
+     * calls take their own marks and stack naturally. */
+    Mark m = mark();
+    int rc = 0;
+
     const char *s = raw;
     while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-    if (!*s) return 0;
+    if (!*s) goto done;
 
     /* labels: no-op during execution (already indexed) */
-    if (*s == ':' && s[1] != ':') return 0;
-    if (s[0] == ':' && s[1] == ':') return 0;
+    if (*s == ':') goto done;
 
-    if (*s == '@') { s++; while (*s == ' ' || *s == '\t') s++; if (!*s) return 0; }
+    if (*s == '@') { s++; while (*s == ' ' || *s == '\t') s++; if (!*s) goto done; }
 
     /* leading parenthesized block: execute inner as a sequence */
     if (*s == '(') {
         const char *rest;
         char *body = peel_paren(s, &rest);
-        if (body) {
-            int rc = execute_seq(body);
-            free(body);
-            return rc;
-        }
+        if (body) { rc = execute_seq(body); goto done; }
     }
 
     /* `rem ...` shortcut (before any expansion) */
     if ((s[0] == 'r' || s[0] == 'R') && (s[1] == 'e' || s[1] == 'E') &&
         (s[2] == 'm' || s[2] == 'M') && (s[3] == 0 || s[3] == ' ' || s[3] == '\t'))
-        return 0;
+        goto done;
 
     /* Peek the first word -- for `for` and `if` we keep the body raw and let
      * per-sub-command expansion happen at execute time.  For everything else
@@ -1736,13 +1758,12 @@ static int execute_stmt(const char *raw) {
     char word[32];
     const char *after = peek_word(s, word, sizeof word);
 
-    if (strcmp(word, "for") == 0) return do_for(after);
-    if (strcmp(word, "if") == 0) return eval_if(after);
+    if (strcmp(word, "for") == 0) { rc = do_for(after); goto done; }
+    if (strcmp(word, "if") == 0) { rc = eval_if(after); goto done; }
 
-    char *copy = xstrdup(s);
+    char *copy = sdup(s);
     trim_right(copy);
     char *exp = expand(copy);
-    free(copy);
 
     RedirSaved saved;
     apply_redir(exp, &saved);
@@ -1751,30 +1772,27 @@ static int execute_stmt(const char *raw) {
     while (*t == ' ' || *t == '\t' || *t == '\n') t++;
     if (*t == '@') { t++; while (*t == ' ' || *t == '\t') t++; }
 
-    int rc = 0;
     if (*t) rc = run_simple(t);
 
     restore_redir(&saved);
-    free(exp);
     g_errorlevel = rc;
+
+done:
+    reset_to(m);
     return rc;
 }
 
 static int execute_seq(const char *raw) {
-    /* split on top-level `&` and `\n`, execute each */
+    /* split on top-level `&` and `\n`, execute each. The parts array sits in
+     * the arena above our caller's mark; each execute_stmt resets back to its
+     * own (higher) mark, so the parts array survives the inner resets. */
     char **parts = NULL;
     int n = split_seq(raw, &parts);
     int rc = 0;
     for (int i = 0; i < n; i++) {
         rc = execute_stmt(parts[i]);
-        free(parts[i]);
-        if (g_frame && g_frame->returning) {
-            /* free remaining parts */
-            for (int j = i + 1; j < n; j++) free(parts[j]);
-            break;
-        }
+        if (g_frame && g_frame->returning) break;
     }
-    free(parts);
     return rc;
 }
 
@@ -1815,25 +1833,25 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_sigint);
     atexit(tty_cbreak_off);
 
+    arena_init(&g_scratch, 4 * 1024 * 1024);
+
     const char *path = argv[1];
     char *resolved = find_script(path);
     if (!resolved) { fprintf(stderr, "cmd: cannot find script: %s\n", path); return 1; }
 
     Script *s = script_load(resolved);
-    if (!s) { fprintf(stderr, "cmd: failed to load: %s\n", resolved); free(resolved); return 1; }
+    if (!s) { fprintf(stderr, "cmd: failed to load: %s\n", resolved); return 1; }
 
-    /* args[0] = script name (as given), args[1..] = remaining argv */
+    /* args[0] = script name (as given), args[1..] = remaining argv. These
+     * live in the arena below every per-statement mark for the whole run. */
     int nargs = 1 + (argc - 2);
-    char **args = xmalloc((size_t)nargs * sizeof *args);
-    args[0] = xstrdup(path);
-    for (int i = 2; i < argc; i++) args[i - 1] = xstrdup(argv[i]);
+    char **args = sbump((size_t)nargs * sizeof *args);
+    args[0] = sdup(path);
+    for (int i = 2; i < argc; i++) args[i - 1] = sdup(argv[i]);
 
     int rc = execute_script(s, args, nargs);
 
-    for (int i = 0; i < nargs; i++) free(args[i]);
-    free(args);
     script_free(s);
-    free(resolved);
     tty_cbreak_off();
     return rc;
 }
